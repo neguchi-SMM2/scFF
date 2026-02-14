@@ -225,10 +225,11 @@ function connectWebSocket() {
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
 
+    // ★修正：handshakeの形式を変更
     ws.send(JSON.stringify({
       method: "handshake",
-      user: "FollowSyncServer",
       project_id: PROJECT_ID
+      // userフィールドを削除（ゲスト接続）
     }));
 
     // pingIntervalを設定（重複防止）
@@ -239,7 +240,10 @@ function connectWebSocket() {
     }, 30000);
   });
 
-  ws.on("message", handleMessage);
+  ws.on("message", (msg) => {
+    console.log("Received:", msg.toString());
+    handleMessage(msg);
+  });
 
   ws.on("error", (err) => {
     console.error("WebSocket error:", err);
