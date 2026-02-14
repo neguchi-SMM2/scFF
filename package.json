@@ -1,17 +1,17 @@
 {
-  "name": "scFF",
+  "name": "followsync",
   "version": "1.0.0",
-  "description": "cloud server for scFF",
-  "main": "index.js",
+  "main": "node.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node node.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "express": "^4.18.2",
+    "ws": "^8.17.0",
     "node-fetch": "^2.6.7"
   }
 }
