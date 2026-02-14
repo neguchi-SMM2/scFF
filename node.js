@@ -74,7 +74,7 @@ async function getFollowers(username) {
     `https://api.scratch.mit.edu/users/${username}/followers?limit=40`,
     {
       headers: {
-        "User-Agent": "scFFServer/1.0"
+        "User-Agent": "FollowSyncServer/1.0"
       }
     }
   );
@@ -124,11 +124,29 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (data.method !== "set") return;
-  if (data.name !== "☁request") return;
+  console.log("Parsed message:", JSON.stringify(data));
+
+  // methodチェック
+  if (data.method !== "set") {
+    console.log("Ignoring: method is not 'set'");
+    return;
+  }
+
+  console.log("Method is 'set', variable name:", data.name);
+
+  // 変数名チェック
+  if (data.name !== "☁ request") {
+    console.log("Ignoring: variable name is not '☁ request' (actual:", data.name, ")");
+    return;
+  }
 
   const request = data.value;
-  if (!request || request === "0") return;
+  console.log("Request value:", request);
+
+  if (!request || request === "0") {
+    console.log("Ignoring: request is empty or 0");
+    return;
+  }
 
   /* ===== 0.5秒クールダウン ===== */
 
@@ -138,6 +156,8 @@ async function handleMessage(msg) {
     return;
   }
   lastRequestTime = now;
+
+  console.log("Processing request...");
 
   /* ===== リクエスト解析 ===== */
 
@@ -155,11 +175,12 @@ async function handleMessage(msg) {
 
   const username = decodeUsername(encodedUsername);
 
-  console.log("Request from:", username);
+  console.log("Request from:", username, "userId:", userId);
 
   /* ===== フォロワー取得 ===== */
 
   const followers = await getFollowers(username);
+  console.log("Fetched followers:", followers.length);
 
   const wrappedUsers = followers.map(f => {
     const encoded = encodeUsername(f.username);
@@ -167,14 +188,16 @@ async function handleMessage(msg) {
   });
 
   const returns = splitCloudData(userId, wrappedUsers);
+  console.log("Split into", returns.length, "chunks");
 
   /* ===== 既存return初期化 ===== */
 
+  console.log("Initializing return variables...");
   for (let i = 1; i <= 9; i++) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         method: "set",
-        name: `☁return${i}`,
+        name: `☁ return${i}`,
         value: "0"
       }));
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -183,11 +206,13 @@ async function handleMessage(msg) {
 
   /* ===== return送信（順序保証のため遅延追加） ===== */
 
+  console.log("Sending return data...");
   for (let i = 0; i < returns.length && i < 9; i++) {
     if (ws.readyState === WebSocket.OPEN) {
+      console.log(`Sending return${i + 1}:`, returns[i].substring(0, 50) + "...");
       ws.send(JSON.stringify({
         method: "set",
-        name: `☁return${i + 1}`,
+        name: `☁ return${i + 1}`,
         value: returns[i]
       }));
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -196,15 +221,16 @@ async function handleMessage(msg) {
 
   /* ===== requestリセット ===== */
 
+  console.log("Resetting request...");
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       method: "set",
-      name: "☁request",
+      name: "☁ request",
       value: "0"
     }));
   }
 
-  console.log("Response sent");
+  console.log("Response sent successfully!");
 }
 
 /* ===== TurboWarp接続（再接続機能付き） ===== */
@@ -225,8 +251,7 @@ function connectWebSocket() {
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
 
-    // ★修正：playerで始まるユーザー名（2-7桁のランダム数字）
-    const randomNum = Math.floor(Math.random() * 900000) + 100000; // 6桁の数字
+    const randomNum = Math.floor(Math.random() * 900000) + 100000;
     const username = `player${randomNum}`;
     
     const handshakeMsg = JSON.stringify({
@@ -247,8 +272,10 @@ function connectWebSocket() {
   });
 
   ws.on("message", (msg) => {
-    console.log("Received:", msg.toString());
+    console.log("\n=== Received message ===");
+    console.log("Raw:", msg.toString());
     handleMessage(msg);
+    console.log("=== End message ===\n");
   });
 
   ws.on("error", (err) => {
