@@ -67,11 +67,32 @@ function decodeUsername(encoded) {
   return result;
 }
 
+/* ===== lengthWrapデコード（ユーザー名用） ===== */
+
+function decodeLengthWrap(str, startPos) {
+  const lenLen = parseInt(str[startPos]);
+  const len = parseInt(str.slice(startPos + 1, startPos + 1 + lenLen));
+  const data = str.slice(startPos + 1 + lenLen, startPos + 1 + lenLen + len);
+  const nextPos = startPos + 1 + lenLen + len;
+  
+  return { data, nextPos };
+}
+
+/* ===== 単純なデータ長デコード（userId, range用） ===== */
+
+function decodeSimple(str, startPos) {
+  const dataLen = parseInt(str[startPos]);
+  const data = str.slice(startPos + 1, startPos + 1 + dataLen);
+  const nextPos = startPos + 1 + dataLen;
+  
+  return { data, nextPos };
+}
+
 /* ===== Scratch API ===== */
 
-async function getFollowers(username) {
+async function getFollowers(username, offset = 0, limit = 40) {
   const res = await fetch(
-    `https://api.scratch.mit.edu/users/${username}/followers?limit=40`,
+    `https://api.scratch.mit.edu/users/${username}/followers?offset=${offset}&limit=${limit}`,
     {
       headers: {
         "User-Agent": "FollowSyncServer/1.0"
@@ -116,7 +137,6 @@ function splitCloudData(userIdHeader, wrappedUsers) {
 async function handleMessage(msg) {
   let data;
 
-  // JSONでないメッセージは無視（重要）
   try {
     data = JSON.parse(msg);
   } catch {
@@ -124,29 +144,11 @@ async function handleMessage(msg) {
     return;
   }
 
-  console.log("Parsed message:", JSON.stringify(data));
-
-  // methodチェック
-  if (data.method !== "set") {
-    console.log("Ignoring: method is not 'set'");
-    return;
-  }
-
-  console.log("Method is 'set', variable name:", data.name);
-
-  // 変数名チェック
-  if (data.name !== "☁ request") {
-    console.log("Ignoring: variable name is not '☁ request' (actual:", data.name, ")");
-    return;
-  }
+  if (data.method !== "set") return;
+  if (data.name !== "☁ request") return;
 
   const request = data.value;
-  console.log("Request value:", request);
-
-  if (!request || request === "0") {
-    console.log("Ignoring: request is empty or 0");
-    return;
-  }
+  if (!request || request === "0") return;
 
   /* ===== 0.5秒クールダウン ===== */
 
@@ -157,29 +159,55 @@ async function handleMessage(msg) {
   }
   lastRequestTime = now;
 
-  console.log("Processing request...");
+  console.log("\n=== Processing Request ===");
+  console.log("Raw request:", request);
 
   /* ===== リクエスト解析 ===== */
+  // フォーマット: type + lengthWrap(encodedUsername) + simpleWrap(userId) + simpleWrap(range_start) + simpleWrap(range_end)
 
-  const userIdLenLen = parseInt(request[0]);
-  const userIdLen = parseInt(request.slice(1, 1 + userIdLenLen));
+  let pos = 0;
+  
+  // type (1文字)
+  const type = request[pos];
+  pos += 1;
+  console.log("Type:", type);
 
-  const userId = request.slice(
-    1 + userIdLenLen,
-    1 + userIdLenLen + userIdLen
-  );
-
-  const encodedUsername = request.slice(
-    1 + userIdLenLen + userIdLen
-  );
+  // lengthWrap(encodedUsername)
+  const usernameResult = decodeLengthWrap(request, pos);
+  const encodedUsername = usernameResult.data;
+  pos = usernameResult.nextPos;
+  console.log("Encoded username:", encodedUsername);
 
   const username = decodeUsername(encodedUsername);
+  console.log("Decoded username:", username);
 
-  console.log("Request from:", username, "userId:", userId);
+  // simpleWrap(userId)
+  const userIdResult = decodeSimple(request, pos);
+  const userId = userIdResult.data;
+  pos = userIdResult.nextPos;
+  console.log("UserId:", userId);
+
+  // simpleWrap(range_start)
+  const rangeStartResult = decodeSimple(request, pos);
+  const rangeStart = rangeStartResult.data;
+  pos = rangeStartResult.nextPos;
+  console.log("Range start:", rangeStart);
+
+  // simpleWrap(range_end)
+  const rangeEndResult = decodeSimple(request, pos);
+  const rangeEnd = rangeEndResult.data;
+  console.log("Range end:", rangeEnd);
+
+  console.log(`Request from: ${username}, userId: ${userId}, range: ${rangeStart}-${rangeEnd}`);
 
   /* ===== フォロワー取得 ===== */
 
-  const followers = await getFollowers(username);
+  const offset = parseInt(rangeStart) - 1;
+  const limit = parseInt(rangeEnd) - parseInt(rangeStart) + 1;
+
+  console.log(`Fetching followers: offset=${offset}, limit=${limit}`);
+
+  const followers = await getFollowers(username, offset, limit);
   console.log("Fetched followers:", followers.length);
 
   const wrappedUsers = followers.map(f => {
@@ -192,7 +220,6 @@ async function handleMessage(msg) {
 
   /* ===== 既存return初期化 ===== */
 
-  console.log("Initializing return variables...");
   for (let i = 1; i <= 9; i++) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -204,12 +231,11 @@ async function handleMessage(msg) {
     }
   }
 
-  /* ===== return送信（順序保証のため遅延追加） ===== */
+  /* ===== return送信 ===== */
 
-  console.log("Sending return data...");
   for (let i = 0; i < returns.length && i < 9; i++) {
     if (ws.readyState === WebSocket.OPEN) {
-      console.log(`Sending return${i + 1}:`, returns[i].substring(0, 50) + "...");
+      console.log(`Sending return${i + 1}, length: ${returns[i].length}`);
       ws.send(JSON.stringify({
         method: "set",
         name: `☁ return${i + 1}`,
@@ -221,7 +247,6 @@ async function handleMessage(msg) {
 
   /* ===== requestリセット ===== */
 
-  console.log("Resetting request...");
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       method: "set",
@@ -230,13 +255,12 @@ async function handleMessage(msg) {
     }));
   }
 
-  console.log("Response sent successfully!");
+  console.log("Response sent successfully!\n");
 }
 
 /* ===== TurboWarp接続（再接続機能付き） ===== */
 
 function connectWebSocket() {
-  // 既存のpingIntervalをクリア
   if (pingInterval) {
     clearInterval(pingInterval);
     pingInterval = null;
@@ -254,16 +278,12 @@ function connectWebSocket() {
     const randomNum = Math.floor(Math.random() * 900000) + 100000;
     const username = `player${randomNum}`;
     
-    const handshakeMsg = JSON.stringify({
+    ws.send(JSON.stringify({
       method: "handshake",
       project_id: PROJECT_ID,
       user: username
-    });
-    
-    console.log("Sending handshake:", handshakeMsg);
-    ws.send(handshakeMsg);
+    }));
 
-    // pingIntervalを設定（重複防止）
     pingInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ method: "ping" }));
@@ -271,12 +291,7 @@ function connectWebSocket() {
     }, 30000);
   });
 
-  ws.on("message", (msg) => {
-    console.log("\n=== Received message ===");
-    console.log("Raw:", msg.toString());
-    handleMessage(msg);
-    console.log("=== End message ===\n");
-  });
+  ws.on("message", handleMessage);
 
   ws.on("error", (err) => {
     console.error("WebSocket error:", err);
@@ -285,7 +300,6 @@ function connectWebSocket() {
   ws.on("close", (code, reason) => {
     console.log(`WebSocket closed (code: ${code}, reason: ${reason}), reconnecting in 5s...`);
     
-    // pingIntervalをクリア
     if (pingInterval) {
       clearInterval(pingInterval);
       pingInterval = null;
