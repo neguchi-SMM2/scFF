@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("FollowSync running"));
+app.get("/", (req, res) => res.send("scFF_server running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
@@ -88,9 +88,9 @@ function decodeSimple(str, startPos) {
   return { data, nextPos };
 }
 
-/* ===== Scratch API ===== */
+/* ===== Scratch API（単一リクエスト） ===== */
 
-async function getFollowers(username, offset = 0, limit = 40) {
+async function getFollowersBatch(username, offset, limit) {
   const res = await fetch(
     `https://api.scratch.mit.edu/users/${username}/followers?offset=${offset}&limit=${limit}`,
     {
@@ -101,11 +101,46 @@ async function getFollowers(username, offset = 0, limit = 40) {
   );
 
   if (!res.ok) {
-    console.log("Scratch API error:", res.status);
+    console.log(`Scratch API error: ${res.status} (offset=${offset}, limit=${limit})`);
     return [];
   }
 
   return await res.json();
+}
+
+/* ===== Scratch API（分割リクエスト対応） ===== */
+
+async function getFollowers(username, offset, totalLimit) {
+  const MAX_LIMIT = 40;
+  const allFollowers = [];
+  
+  let currentOffset = offset;
+  let remaining = totalLimit;
+
+  while (remaining > 0) {
+    const batchLimit = Math.min(remaining, MAX_LIMIT);
+    
+    console.log(`  API call: offset=${currentOffset}, limit=${batchLimit}`);
+    
+    const batch = await getFollowersBatch(username, currentOffset, batchLimit);
+    
+    if (batch.length === 0) {
+      break; // これ以上データがない
+    }
+    
+    allFollowers.push(...batch);
+    
+    currentOffset += batchLimit;
+    remaining -= batchLimit;
+    
+    // 複数回リクエストする場合は少し待機（レート制限対策）
+    if (remaining > 0) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  console.log(`  Total fetched: ${allFollowers.length} followers`);
+  return allFollowers;
 }
 
 /* ===== 分割処理 ===== */
@@ -163,7 +198,6 @@ async function handleMessage(msg) {
   console.log("Raw request:", request);
 
   /* ===== リクエスト解析 ===== */
-  // フォーマット: type + lengthWrap(encodedUsername) + simpleWrap(userId) + simpleWrap(range_start) + simpleWrap(range_end)
 
   let pos = 0;
   
@@ -176,10 +210,9 @@ async function handleMessage(msg) {
   const usernameResult = decodeLengthWrap(request, pos);
   const encodedUsername = usernameResult.data;
   pos = usernameResult.nextPos;
-  console.log("Encoded username:", encodedUsername);
 
   const username = decodeUsername(encodedUsername);
-  console.log("Decoded username:", username);
+  console.log("Username:", username);
 
   // simpleWrap(userId)
   const userIdResult = decodeSimple(request, pos);
@@ -189,26 +222,24 @@ async function handleMessage(msg) {
 
   // simpleWrap(range_start)
   const rangeStartResult = decodeSimple(request, pos);
-  const rangeStart = rangeStartResult.data;
+  const rangeStart = parseInt(rangeStartResult.data);
   pos = rangeStartResult.nextPos;
-  console.log("Range start:", rangeStart);
 
   // simpleWrap(range_end)
   const rangeEndResult = decodeSimple(request, pos);
-  const rangeEnd = rangeEndResult.data;
-  console.log("Range end:", rangeEnd);
+  const rangeEnd = parseInt(rangeEndResult.data);
+  
+  console.log(`Range: ${rangeStart}-${rangeEnd}`);
 
-  console.log(`Request from: ${username}, userId: ${userId}, range: ${rangeStart}-${rangeEnd}`);
+  /* ===== フォロワー取得（分割対応） ===== */
 
-  /* ===== フォロワー取得 ===== */
+  const offset = rangeStart - 1;
+  const totalLimit = rangeEnd - rangeStart + 1;
 
-  const offset = parseInt(rangeStart) - 1;
-  const limit = parseInt(rangeEnd) - parseInt(rangeStart) + 1;
+  console.log(`Fetching followers: offset=${offset}, totalLimit=${totalLimit}`);
 
-  console.log(`Fetching followers: offset=${offset}, limit=${limit}`);
-
-  const followers = await getFollowers(username, offset, limit);
-  console.log("Fetched followers:", followers.length);
+  const followers = await getFollowers(username, offset, totalLimit);
+  console.log(`Successfully fetched ${followers.length} followers`);
 
   const wrappedUsers = followers.map(f => {
     const encoded = encodeUsername(f.username);
@@ -216,7 +247,7 @@ async function handleMessage(msg) {
   });
 
   const returns = splitCloudData(userId, wrappedUsers);
-  console.log("Split into", returns.length, "chunks");
+  console.log(`Split into ${returns.length} chunks`);
 
   /* ===== 既存return初期化 ===== */
 
