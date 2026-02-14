@@ -69,8 +69,19 @@ function decodeUsername(encoded) {
 
 async function getFollowers(username) {
   const res = await fetch(
-    `https://api.scratch.mit.edu/users/${username}/followers?limit=40`
+    `https://api.scratch.mit.edu/users/${username}/followers?limit=40`,
+    {
+      headers: {
+        "User-Agent": "FollowSyncServer/1.0"
+      }
+    }
   );
+
+  if (!res.ok) {
+    console.log("Scratch API error:", res.status);
+    return [];
+  }
+
   return await res.json();
 }
 
@@ -98,9 +109,13 @@ function splitCloudData(userIdHeader, wrappedUsers) {
   return result;
 }
 
-/* ===== TurboWarp接続 ===== */
+/* ===== TurboWarp接続（User-Agent必須） ===== */
 
-const ws = new WebSocket(TURBOWARP_SERVER);
+const ws = new WebSocket(TURBOWARP_SERVER, {
+  headers: {
+    "User-Agent": "FollowSyncServer/1.0 (Render)"
+  }
+});
 
 ws.on("open", () => {
   console.log("Connected to TurboWarp");
@@ -112,8 +127,19 @@ ws.on("open", () => {
   }));
 });
 
+/* ===== メッセージ受信 ===== */
+
 ws.on("message", async (msg) => {
-  const data = JSON.parse(msg);
+
+  let data;
+
+  // JSONでないメッセージは無視（重要）
+  try {
+    data = JSON.parse(msg);
+  } catch {
+    console.log("Non-JSON message:", msg.toString());
+    return;
+  }
 
   if (data.method !== "set") return;
   if (data.name !== "☁request") return;
@@ -124,7 +150,10 @@ ws.on("message", async (msg) => {
   /* ===== 0.5秒クールダウン ===== */
 
   const now = Date.now();
-  if (now - lastRequestTime < 500) return;
+  if (now - lastRequestTime < 500) {
+    console.log("Cooldown active");
+    return;
+  }
   lastRequestTime = now;
 
   /* ===== リクエスト解析 ===== */
@@ -187,4 +216,14 @@ ws.on("message", async (msg) => {
   }));
 
   console.log("Response sent");
+});
+
+/* ===== エラー対策 ===== */
+
+ws.on("error", (err) => {
+  console.error("WebSocket error:", err);
+});
+
+ws.on("close", () => {
+  console.log("WebSocket closed");
 });
