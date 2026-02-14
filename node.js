@@ -13,6 +13,7 @@ const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 
 let lastRequestTime = 0;
 let ws = null;
+let pingInterval = null;
 
 /* ===== エンコード表 ===== */
 
@@ -170,32 +171,38 @@ async function handleMessage(msg) {
   /* ===== 既存return初期化 ===== */
 
   for (let i = 1; i <= 9; i++) {
-    ws.send(JSON.stringify({
-      method: "set",
-      name: `☁return${i}`,
-      value: "0"
-    }));
-    await new Promise(resolve => setTimeout(resolve, 50));
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        method: "set",
+        name: `☁return${i}`,
+        value: "0"
+      }));
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 
   /* ===== return送信（順序保証のため遅延追加） ===== */
 
   for (let i = 0; i < returns.length && i < 9; i++) {
-    ws.send(JSON.stringify({
-      method: "set",
-      name: `☁return${i + 1}`,
-      value: returns[i]
-    }));
-    await new Promise(resolve => setTimeout(resolve, 50));
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        method: "set",
+        name: `☁return${i + 1}`,
+        value: returns[i]
+      }));
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 
   /* ===== requestリセット ===== */
 
-  ws.send(JSON.stringify({
-    method: "set",
-    name: "☁request",
-    value: "0"
-  }));
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      method: "set",
+      name: "☁request",
+      value: "0"
+    }));
+  }
 
   console.log("Response sent");
 }
@@ -203,6 +210,12 @@ async function handleMessage(msg) {
 /* ===== TurboWarp接続（再接続機能付き） ===== */
 
 function connectWebSocket() {
+  // 既存のpingIntervalをクリア
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+
   ws = new WebSocket(TURBOWARP_SERVER, {
     headers: {
       "User-Agent": "FollowSyncServer/1.0 (Render)"
@@ -218,8 +231,9 @@ function connectWebSocket() {
       project_id: PROJECT_ID
     }));
 
-    setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
+    // pingIntervalを設定（重複防止）
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ method: "ping" }));
       }
     }, 30000);
@@ -231,8 +245,15 @@ function connectWebSocket() {
     console.error("WebSocket error:", err);
   });
 
-  ws.on("close", () => {
-    console.log("WebSocket closed, reconnecting in 5s...");
+  ws.on("close", (code, reason) => {
+    console.log(`WebSocket closed (code: ${code}, reason: ${reason}), reconnecting in 5s...`);
+    
+    // pingIntervalをクリア
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+    
     setTimeout(connectWebSocket, 5000);
   });
 }
