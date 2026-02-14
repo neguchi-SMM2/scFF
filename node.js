@@ -12,6 +12,7 @@ const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 
 let lastRequestTime = 0;
+let ws = null;
 
 /* ===== エンコード表 ===== */
 
@@ -109,32 +110,9 @@ function splitCloudData(userIdHeader, wrappedUsers) {
   return result;
 }
 
-/* ===== TurboWarp接続（User-Agent必須） ===== */
+/* ===== メッセージ受信ハンドラ ===== */
 
-const ws = new WebSocket(TURBOWARP_SERVER, {
-  headers: {
-    "User-Agent": "FollowSyncServer/1.0 (Render)"
-  }
-});
-
-ws.on("open", () => {
-  console.log("Connected to TurboWarp");
-
-  ws.send(JSON.stringify({
-    method: "handshake",
-    user: "FollowSyncServer",
-    project_id: PROJECT_ID
-  }));
-
-  setInterval(() => {
-    ws.send(JSON.stringify({ method: "ping" }));
-  }, 30000);
-});
-
-/* ===== メッセージ受信 ===== */
-
-ws.on("message", async (msg) => {
-
+async function handleMessage(msg) {
   let data;
 
   // JSONでないメッセージは無視（重要）
@@ -197,19 +175,19 @@ ws.on("message", async (msg) => {
       name: `☁return${i}`,
       value: "0"
     }));
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
-  /* ===== return送信 ===== */
+  /* ===== return送信（順序保証のため遅延追加） ===== */
 
-  returns.forEach((chunk, index) => {
-    if (index >= 9) return;
-
+  for (let i = 0; i < returns.length && i < 9; i++) {
     ws.send(JSON.stringify({
       method: "set",
-      name: `☁return${index + 1}`,
-      value: chunk
+      name: `☁return${i + 1}`,
+      value: returns[i]
     }));
-  });
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
 
   /* ===== requestリセット ===== */
 
@@ -220,14 +198,45 @@ ws.on("message", async (msg) => {
   }));
 
   console.log("Response sent");
-});
+}
 
-/* ===== エラー対策 ===== */
+/* ===== TurboWarp接続（再接続機能付き） ===== */
 
-ws.on("error", (err) => {
-  console.error("WebSocket error:", err);
-});
+function connectWebSocket() {
+  ws = new WebSocket(TURBOWARP_SERVER, {
+    headers: {
+      "User-Agent": "FollowSyncServer/1.0 (Render)"
+    }
+  });
 
-ws.on("close", () => {
-  console.log("WebSocket closed");
-});
+  ws.on("open", () => {
+    console.log("Connected to TurboWarp");
+
+    ws.send(JSON.stringify({
+      method: "handshake",
+      user: "FollowSyncServer",
+      project_id: PROJECT_ID
+    }));
+
+    setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ method: "ping" }));
+      }
+    }, 30000);
+  });
+
+  ws.on("message", handleMessage);
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+  });
+
+  ws.on("close", () => {
+    console.log("WebSocket closed, reconnecting in 5s...");
+    setTimeout(connectWebSocket, 5000);
+  });
+}
+
+/* ===== 初回接続 ===== */
+
+connectWebSocket();
