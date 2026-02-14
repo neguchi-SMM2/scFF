@@ -74,7 +74,7 @@ async function getFollowers(username) {
     `https://api.scratch.mit.edu/users/${username}/followers?limit=40`,
     {
       headers: {
-        "User-Agent": "FollowSyncServer/1.0"
+        "User-Agent": "scFFServer/1.0"
       }
     }
   );
@@ -218,24 +218,25 @@ function connectWebSocket() {
 
   ws = new WebSocket(TURBOWARP_SERVER, {
     headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      "User-Agent": "FollowSyncServer/1.0 contact:https://github.com/yourproject"
     }
   });
 
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
 
-    // 接続直後に少し待機してからhandshake
-    setTimeout(() => {
-      const handshakeMsg = JSON.stringify({
-        method: "handshake",
-        project_id: PROJECT_ID,
-        user: "server" + Math.floor(Math.random() * 10000)
-      });
-      
-      console.log("Sending handshake:", handshakeMsg);
-      ws.send(handshakeMsg);
-    }, 100);
+    // ★修正：playerで始まるユーザー名（2-7桁のランダム数字）
+    const randomNum = Math.floor(Math.random() * 900000) + 100000; // 6桁の数字
+    const username = `player${randomNum}`;
+    
+    const handshakeMsg = JSON.stringify({
+      method: "handshake",
+      project_id: PROJECT_ID,
+      user: username
+    });
+    
+    console.log("Sending handshake:", handshakeMsg);
+    ws.send(handshakeMsg);
 
     // pingIntervalを設定（重複防止）
     pingInterval = setInterval(() => {
