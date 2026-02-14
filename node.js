@@ -125,6 +125,10 @@ ws.on("open", () => {
     user: "FollowSyncServer",
     project_id: PROJECT_ID
   }));
+
+  setInterval(() => {
+    ws.send(JSON.stringify({ method: "ping" }));
+  }, 30000);
 });
 
 /* ===== メッセージ受信 ===== */
