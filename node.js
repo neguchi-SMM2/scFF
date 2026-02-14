@@ -218,19 +218,24 @@ function connectWebSocket() {
 
   ws = new WebSocket(TURBOWARP_SERVER, {
     headers: {
-      "User-Agent": "FollowSyncServer/1.0 (Render)"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
   });
 
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
 
-    // ★修正：handshakeの形式を変更
-    ws.send(JSON.stringify({
-      method: "handshake",
-      project_id: PROJECT_ID
-      // userフィールドを削除（ゲスト接続）
-    }));
+    // 接続直後に少し待機してからhandshake
+    setTimeout(() => {
+      const handshakeMsg = JSON.stringify({
+        method: "handshake",
+        project_id: PROJECT_ID,
+        user: "server" + Math.floor(Math.random() * 10000)
+      });
+      
+      console.log("Sending handshake:", handshakeMsg);
+      ws.send(handshakeMsg);
+    }, 100);
 
     // pingIntervalを設定（重複防止）
     pingInterval = setInterval(() => {
