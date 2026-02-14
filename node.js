@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("scFF_server running"));
+app.get("/", (req, res) => res.send("FollowSync running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
@@ -90,9 +90,9 @@ function decodeSimple(str, startPos) {
 
 /* ===== Scratch API（単一リクエスト） ===== */
 
-async function getFollowersBatch(username, offset, limit) {
+async function getScratchDataBatch(username, endpoint, offset, limit) {
   const res = await fetch(
-    `https://api.scratch.mit.edu/users/${username}/followers?offset=${offset}&limit=${limit}`,
+    `https://api.scratch.mit.edu/users/${username}/${endpoint}?offset=${offset}&limit=${limit}`,
     {
       headers: {
         "User-Agent": "FollowSyncServer/1.0"
@@ -101,7 +101,7 @@ async function getFollowersBatch(username, offset, limit) {
   );
 
   if (!res.ok) {
-    console.log(`Scratch API error: ${res.status} (offset=${offset}, limit=${limit})`);
+    console.log(`Scratch API error: ${res.status} (${endpoint}, offset=${offset}, limit=${limit})`);
     return [];
   }
 
@@ -110,9 +110,9 @@ async function getFollowersBatch(username, offset, limit) {
 
 /* ===== Scratch API（分割リクエスト対応） ===== */
 
-async function getFollowers(username, offset, totalLimit) {
+async function getScratchData(username, endpoint, offset, totalLimit) {
   const MAX_LIMIT = 40;
-  const allFollowers = [];
+  const allData = [];
   
   let currentOffset = offset;
   let remaining = totalLimit;
@@ -120,15 +120,15 @@ async function getFollowers(username, offset, totalLimit) {
   while (remaining > 0) {
     const batchLimit = Math.min(remaining, MAX_LIMIT);
     
-    console.log(`  API call: offset=${currentOffset}, limit=${batchLimit}`);
+    console.log(`  API call (${endpoint}): offset=${currentOffset}, limit=${batchLimit}`);
     
-    const batch = await getFollowersBatch(username, currentOffset, batchLimit);
+    const batch = await getScratchDataBatch(username, endpoint, currentOffset, batchLimit);
     
     if (batch.length === 0) {
       break; // これ以上データがない
     }
     
-    allFollowers.push(...batch);
+    allData.push(...batch);
     
     currentOffset += batchLimit;
     remaining -= batchLimit;
@@ -139,8 +139,110 @@ async function getFollowers(username, offset, totalLimit) {
     }
   }
 
-  console.log(`  Total fetched: ${allFollowers.length} followers`);
-  return allFollowers;
+  console.log(`  Total fetched (${endpoint}): ${allData.length}`);
+  return allData;
+}
+
+/* ===== 全データ取得（相互フォロー用） ===== */
+
+async function getAllScratchData(username, endpoint) {
+  const MAX_LIMIT = 40;
+  const allData = [];
+  
+  let offset = 0;
+  
+  while (true) {
+    console.log(`  API call (${endpoint}): offset=${offset}, limit=${MAX_LIMIT}`);
+    
+    const batch = await getScratchDataBatch(username, endpoint, offset, MAX_LIMIT);
+    
+    if (batch.length === 0) {
+      break;
+    }
+    
+    allData.push(...batch);
+    
+    if (batch.length < MAX_LIMIT) {
+      break; // 最後のバッチ
+    }
+    
+    offset += MAX_LIMIT;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  console.log(`  Total fetched (${endpoint}): ${allData.length}`);
+  return allData;
+}
+
+/* ===== 相互フォロー取得 ===== */
+
+async function getMutualFollows(username, rangeStart, rangeEnd) {
+  console.log("Fetching all followers and following for mutual check...");
+  
+  const [followers, following] = await Promise.all([
+    getAllScratchData(username, "followers"),
+    getAllScratchData(username, "following")
+  ]);
+
+  // フォロー中のユーザー名をSetに変換（高速検索用）
+  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
+
+  // 相互フォローのユーザーを抽出
+  const mutualFollows = followers.filter(f => 
+    followingSet.has(f.username.toLowerCase())
+  );
+
+  console.log(`Found ${mutualFollows.length} mutual follows`);
+
+  // range_startとrange_endで切り出し
+  const offset = rangeStart - 1;
+  const limit = rangeEnd - rangeStart + 1;
+  const result = mutualFollows.slice(offset, offset + limit);
+
+  console.log(`Returning ${result.length} mutual follows (range ${rangeStart}-${rangeEnd})`);
+  return result;
+}
+
+/* ===== 相互フォローでないユーザー取得 ===== */
+
+async function getNonMutualUsers(username, rangeStart, rangeEnd) {
+  console.log("Fetching all followers and following for non-mutual check...");
+  
+  const [followers, following] = await Promise.all([
+    getAllScratchData(username, "followers"),
+    getAllScratchData(username, "following")
+  ]);
+
+  // フォロワーと相互フォローのユーザー名をSetに変換
+  const followersSet = new Set(followers.map(u => u.username.toLowerCase()));
+  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
+
+  // 相互フォローでないユーザーを抽出（フォロワーだがフォロー中でない、またはフォロー中だがフォロワーでない）
+  const nonMutualUsers = [];
+
+  // フォロワーだがフォロー中でないユーザー
+  for (const follower of followers) {
+    if (!followingSet.has(follower.username.toLowerCase())) {
+      nonMutualUsers.push(follower);
+    }
+  }
+
+  // フォロー中だがフォロワーでないユーザー
+  for (const followingUser of following) {
+    if (!followersSet.has(followingUser.username.toLowerCase())) {
+      nonMutualUsers.push(followingUser);
+    }
+  }
+
+  console.log(`Found ${nonMutualUsers.length} non-mutual users`);
+
+  // range_startとrange_endで切り出し
+  const offset = rangeStart - 1;
+  const limit = rangeEnd - rangeStart + 1;
+  const result = nonMutualUsers.slice(offset, offset + limit);
+
+  console.log(`Returning ${result.length} non-mutual users (range ${rangeStart}-${rangeEnd})`);
+  return result;
 }
 
 /* ===== 分割処理 ===== */
@@ -231,17 +333,45 @@ async function handleMessage(msg) {
   
   console.log(`Range: ${rangeStart}-${rangeEnd}`);
 
-  /* ===== フォロワー取得（分割対応） ===== */
+  /* ===== データ取得（タイプ別） ===== */
 
-  const offset = rangeStart - 1;
-  const totalLimit = rangeEnd - rangeStart + 1;
+  let users = [];
 
-  console.log(`Fetching followers: offset=${offset}, totalLimit=${totalLimit}`);
+  switch(type) {
+    case "1":
+      console.log("Fetching followers...");
+      const offset1 = rangeStart - 1;
+      const totalLimit1 = rangeEnd - rangeStart + 1;
+      users = await getScratchData(username, "followers", offset1, totalLimit1);
+      break;
 
-  const followers = await getFollowers(username, offset, totalLimit);
-  console.log(`Successfully fetched ${followers.length} followers`);
+    case "2":
+      console.log("Fetching following...");
+      const offset2 = rangeStart - 1;
+      const totalLimit2 = rangeEnd - rangeStart + 1;
+      users = await getScratchData(username, "following", offset2, totalLimit2);
+      break;
 
-  const wrappedUsers = followers.map(f => {
+    case "3":
+      console.log("Fetching mutual follows...");
+      users = await getMutualFollows(username, rangeStart, rangeEnd);
+      break;
+
+    case "4":
+      console.log("Fetching non-mutual users...");
+      users = await getNonMutualUsers(username, rangeStart, rangeEnd);
+      break;
+
+    default:
+      console.log("Unknown request type:", type);
+      return;
+  }
+
+  console.log(`Successfully fetched ${users.length} users`);
+
+  /* ===== データエンコード ===== */
+
+  const wrappedUsers = users.map(f => {
     const encoded = encodeUsername(f.username);
     return lengthWrap(encoded);
   });
