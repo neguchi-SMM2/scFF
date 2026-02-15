@@ -479,10 +479,8 @@ function connectWebSocket() {
   }
   isReconnecting = true;
 
-  // 既存のインターバルをすべてクリア
   clearAllIntervals();
 
-  // 既存のWebSocketをクリーンアップ
   if (ws) {
     try {
       ws.removeAllListeners();
@@ -531,7 +529,6 @@ function connectWebSocket() {
         updateLastUpdate();
       }, 5000);
 
-      // 初回のlast_update送信
       setTimeout(() => {
         updateLastUpdate();
         console.log("Started last_update timer (every 5 seconds)");
@@ -542,7 +539,32 @@ function connectWebSocket() {
     }
   });
 
-  ws.on("message", handleMessage);
+  ws.on("message", (msg) => {
+    let data;
+    
+    try {
+      data = JSON.parse(msg);
+    } catch {
+      // JSON以外は無視
+      return;
+    }
+
+    // TurboWarpサーバーからのpingに応答
+    if (data.method === "ping") {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ method: "pong" }));
+          console.log("Pong sent to TurboWarp server");
+        } catch (error) {
+          console.error("Error sending pong:", error);
+        }
+      }
+      return;
+    }
+
+    // 通常のメッセージ処理
+    handleMessage(msg);
+  });
 
   ws.on("error", (err) => {
     console.error("WebSocket error:", err);
@@ -559,7 +581,6 @@ function connectWebSocket() {
     }, 5000);
   });
 
-  // 接続タイムアウト（10秒）
   setTimeout(() => {
     if (ws && ws.readyState === WebSocket.CONNECTING) {
       console.log("Connection timeout, retrying...");
