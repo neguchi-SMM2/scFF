@@ -11,9 +11,9 @@ app.listen(process.env.PORT || 3000);
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
-const MAX_RETURNS = 20;
+const MAX_RETURNS = 8;
 const CACHE_TTL = 10 * 60 * 1000;
-const FILTER_DELETED_ACCOUNTS = true;
+const FILTER_DELETED_ACCOUNTS = false;
 
 let lastRequestTime = 0;
 let ws = null;
@@ -86,7 +86,6 @@ async function getFollowingList(username) {
   const allFollowing = new Set();
   let offset = 0;
   
-  // 最大500件まで取得（それ以上は時間がかかりすぎる）
   const MAX_FOLLOWING = 500;
   
   while (offset < MAX_FOLLOWING) {
