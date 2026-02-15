@@ -6,8 +6,6 @@ const app = express();
 app.get("/", (req, res) => res.send("scFF_server running"));
 app.listen(process.env.PORT || 3000);
 
-/* ===== 設定 ===== */
-
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
@@ -21,18 +19,15 @@ let pingInterval = null;
 let lastUpdateInterval = null;
 let isReconnecting = false;
 
-// リクエストキュー関連
 let isProcessing = false;
 const requestQueue = [];
 const MAX_QUEUE_SIZE = 10;
 
 const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
 
-/* ===== キャッシュ ===== */
-
 const cache = new Map();
 const accountExistsCache = new Map();
-const followingCache = new Map(); // フォロー中リストのキャッシュ（type3-5用）
+const followingCache = new Map();
 
 function getCacheKey(username, type) {
   return `${username.toLowerCase()}_${type}`;
@@ -67,12 +62,9 @@ function setCache(username, type, data) {
   }
 }
 
-/* ===== フォロー中リストの取得（軽量版・キャッシュ付き） ===== */
-
 async function getFollowingList(username) {
   const lowerUsername = username.toLowerCase();
   
-  // キャッシュチェック
   const cached = followingCache.get(lowerUsername);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     console.log(`  Following list cache HIT for ${username}`);
@@ -104,13 +96,11 @@ async function getFollowingList(username) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`  Following list fetched: ${allFollowing.size} users in ${elapsed}s`);
 
-  // キャッシュに保存
   followingCache.set(lowerUsername, {
     usernames: allFollowing,
     timestamp: Date.now()
   });
 
-  // キャッシュサイズ管理
   if (followingCache.size > 20) {
     const oldestKey = followingCache.keys().next().value;
     followingCache.delete(oldestKey);
@@ -119,12 +109,9 @@ async function getFollowingList(username) {
   return allFollowing;
 }
 
-/* ===== フォロワーリストの取得（軽量版・キャッシュ付き） ===== */
-
 async function getFollowersList(username) {
   const lowerUsername = username.toLowerCase();
   
-  // キャッシュからfollowersリストを取得（followingと同様）
   const cached = cache.get(getCacheKey(username, 'followers_set'));
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     console.log(`  Followers list cache HIT for ${username}`);
@@ -156,7 +143,6 @@ async function getFollowersList(username) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`  Followers list fetched: ${allFollowers.size} users in ${elapsed}s`);
 
-  // キャッシュに保存
   cache.set(getCacheKey(username, 'followers_set'), {
     data: allFollowers,
     timestamp: Date.now()
@@ -165,15 +151,11 @@ async function getFollowersList(username) {
   return allFollowers;
 }
 
-/* ===== 2000年からの秒数を計算 ===== */
-
 function getSecondsSince2000() {
   const now = Date.now();
   const secondsSince2000 = Math.floor((now - YEAR_2000_TIMESTAMP) / 1000);
   return secondsSince2000.toString();
 }
-
-/* ===== last_update更新処理 ===== */
 
 function updateLastUpdate() {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -190,8 +172,6 @@ function updateLastUpdate() {
   }
 }
 
-/* ===== インターバルのクリーンアップ ===== */
-
 function clearAllIntervals() {
   if (pingInterval) {
     clearInterval(pingInterval);
@@ -202,8 +182,6 @@ function clearAllIntervals() {
     lastUpdateInterval = null;
   }
 }
-
-/* ===== エンコード表 ===== */
 
 const map = {};
 
@@ -218,8 +196,6 @@ for (let i = 0; i < 10; i++) {
 map["-"] = "46";
 map["_"] = "47";
 
-/* ===== エンコード ===== */
-
 function encodeUsername(username) {
   let result = "";
   for (const c of username.toLowerCase()) {
@@ -233,8 +209,6 @@ function lengthWrap(encoded) {
   const lenLen = len.length.toString();
   return lenLen + len + encoded;
 }
-
-/* ===== デコード ===== */
 
 function decodeUsername(encoded) {
   let result = "";
@@ -253,8 +227,6 @@ function decodeUsername(encoded) {
   return result;
 }
 
-/* ===== lengthWrapデコード（ユーザー名用） ===== */
-
 function decodeLengthWrap(str, startPos) {
   const lenLen = parseInt(str[startPos]);
   const len = parseInt(str.slice(startPos + 1, startPos + 1 + lenLen));
@@ -264,8 +236,6 @@ function decodeLengthWrap(str, startPos) {
   return { data, nextPos };
 }
 
-/* ===== 単純なデータ長デコード（userId, range用） ===== */
-
 function decodeSimple(str, startPos) {
   const dataLen = parseInt(str[startPos]);
   const data = str.slice(startPos + 1, startPos + 1 + dataLen);
@@ -273,8 +243,6 @@ function decodeSimple(str, startPos) {
   
   return { data, nextPos };
 }
-
-/* ===== アカウント存在チェック ===== */
 
 async function checkAccountExists(username) {
   const lowerUsername = username.toLowerCase();
@@ -306,8 +274,6 @@ async function checkAccountExists(username) {
     return true;
   }
 }
-
-/* ===== アカウント存在チェック（バッチ処理） ===== */
 
 async function filterDeletedAccounts(users) {
   if (!FILTER_DELETED_ACCOUNTS || users.length === 0) {
@@ -345,14 +311,12 @@ async function filterDeletedAccounts(users) {
   return validUsers;
 }
 
-/* ===== Scratch API（単一リクエスト） ===== */
-
 async function getScratchDataBatch(username, endpoint, offset, limit) {
   const res = await fetch(
     `https://api.scratch.mit.edu/users/${username}/${endpoint}?offset=${offset}&limit=${limit}`,
     {
       headers: {
-        "User-Agent": "FollowSyncServer/1.0"
+        "User-Agent": "scFF_Server/1.0"
       }
     }
   );
@@ -364,8 +328,6 @@ async function getScratchDataBatch(username, endpoint, offset, limit) {
 
   return await res.json();
 }
-
-/* ===== Scratch API（分割リクエスト対応） ===== */
 
 async function getScratchData(username, endpoint, offset, totalLimit) {
   const MAX_LIMIT = 40;
@@ -396,8 +358,6 @@ async function getScratchData(username, endpoint, offset, totalLimit) {
   return allData;
 }
 
-/* ===== 分割処理（TurboWarp対応） ===== */
-
 function splitCloudData(userIdHeader, wrappedUsers) {
   const result = [];
   let current = userIdHeader;
@@ -418,12 +378,8 @@ function splitCloudData(userIdHeader, wrappedUsers) {
   return result;
 }
 
-/* ===== リクエスト処理（本体） ===== */
-
 async function processRequest(request) {
   console.log("\n=== Processing Request ===");
-
-  /* ===== リクエスト解析 ===== */
 
   let pos = 0;
   
@@ -451,8 +407,6 @@ async function processRequest(request) {
   
   console.log(`Range: ${rangeStart}-${rangeEnd}`);
 
-  /* ===== データ取得（タイプ別） ===== */
-
   let users = [];
   const startTime = Date.now();
 
@@ -474,45 +428,39 @@ async function processRequest(request) {
 
       case "3":
         console.log("Fetching mutual follows...");
-        // 指定範囲のフォロワーを取得
+        
         const offset3 = rangeStart - 1;
         const totalLimit3 = rangeEnd - rangeStart + 1;
         const followers3 = await getScratchData(username, "followers", offset3, totalLimit3);
         
-        // フォロー中リストを取得（キャッシュ使用）
         const followingSet3 = await getFollowingList(username);
         
-        // 相互フォローをフィルタ
         users = followers3.filter(f => followingSet3.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} mutual follows in range`);
         break;
 
       case "4":
         console.log("Fetching following but not followers...");
-        // 指定範囲のフォロー中を取得
+        
         const offset4 = rangeStart - 1;
         const totalLimit4 = rangeEnd - rangeStart + 1;
         const following4 = await getScratchData(username, "following", offset4, totalLimit4);
         
-        // フォロワーリストを取得（キャッシュ使用）
         const followersSet4 = await getFollowersList(username);
         
-        // フォロワーでないものをフィルタ
         users = following4.filter(f => !followersSet4.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} following but not followers in range`);
         break;
 
       case "5":
         console.log("Fetching followers but not following...");
-        // 指定範囲のフォロワーを取得
+        
         const offset5 = rangeStart - 1;
         const totalLimit5 = rangeEnd - rangeStart + 1;
         const followers5 = await getScratchData(username, "followers", offset5, totalLimit5);
         
-        // フォロー中リストを取得（キャッシュ使用）
         const followingSet5 = await getFollowingList(username);
         
-        // フォロー中でないものをフィルタ
         users = followers5.filter(f => !followingSet5.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} followers but not following in range`);
         break;
@@ -529,19 +477,14 @@ async function processRequest(request) {
   const fetchTime = ((Date.now() - startTime) / 1000).toFixed(2);
   console.log(`Fetched ${users.length} users in ${fetchTime}s`);
 
-  /* ===== 削除アカウントのフィルタリング ===== */
-
   users = await filterDeletedAccounts(users);
   console.log(`Valid users after filtering: ${users.length}`);
-
-  /* ===== データエンコード ===== */
 
   const encodeStart = Date.now();
   
   let returns;
   
   if (users.length === 0) {
-    // データがない場合、userIdだけを返す
     console.log("No users found - returning userId only");
     returns = [userId];
   } else {
@@ -559,8 +502,6 @@ async function processRequest(request) {
   if (returns.length > MAX_RETURNS) {
     console.warn(`Warning: Data requires ${returns.length} chunks but only ${MAX_RETURNS} available`);
   }
-
-  /* ===== return送信 ===== */
 
   const sendStart = Date.now();
 
@@ -603,8 +544,6 @@ async function processRequest(request) {
   }
 }
 
-/* ===== キューから次のリクエストを処理 ===== */
-
 async function processNextRequest() {
   if (isProcessing || requestQueue.length === 0) {
     return;
@@ -627,8 +566,6 @@ async function processNextRequest() {
     }
   }
 }
-
-/* ===== メッセージ受信ハンドラ ===== */
 
 async function handleMessage(msg) {
   let data;
@@ -688,8 +625,6 @@ async function handleMessage(msg) {
   }
 }
 
-/* ===== TurboWarp接続（再接続機能付き） ===== */
-
 function connectWebSocket() {
   if (isReconnecting) {
     return;
@@ -716,6 +651,18 @@ function connectWebSocket() {
     }
   });
 
+  ws.on('ping', (data) => {
+    console.log("Received WebSocket ping frame");
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.pong(data);
+      console.log("Sent WebSocket pong frame");
+    }
+  });
+
+  ws.on('pong', (data) => {
+    console.log("Received WebSocket pong frame");
+  });
+
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
     isReconnecting = false;
@@ -733,12 +680,13 @@ function connectWebSocket() {
       pingInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           try {
-            ws.send(JSON.stringify({ method: "ping" }));
+            ws.ping();
+            console.log("Sent WebSocket ping frame");
           } catch (error) {
             console.error("Error sending ping:", error);
           }
         }
-      }, 30000);
+      }, 20000);
 
       lastUpdateInterval = setInterval(() => {
         updateLastUpdate();
@@ -781,11 +729,8 @@ function connectWebSocket() {
   }, 10000);
 }
 
-/* ===== 初回接続 ===== */
-
 connectWebSocket();
 
-// メモリ使用量の定期監視
 setInterval(() => {
   const used = process.memoryUsage();
   const wsState = ws ? ws.readyState : 'null';
