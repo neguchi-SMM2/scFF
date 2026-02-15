@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("scFF_server running"));
+app.get("/", (req, res) => res.send("FollowSync running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
@@ -11,15 +11,20 @@ app.listen(process.env.PORT || 3000);
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
-const MAX_RETURNS = 8;
-const CACHE_TTL = 10 * 60 * 1000; // 10分間キャッシュ
-const FILTER_DELETED_ACCOUNTS = false; // 削除されたアカウントを除外
+const MAX_RETURNS = 20;
+const CACHE_TTL = 10 * 60 * 1000;
+const FILTER_DELETED_ACCOUNTS = true;
 
 let lastRequestTime = 0;
 let ws = null;
 let pingInterval = null;
 let lastUpdateInterval = null;
 let isReconnecting = false;
+
+// ★★★ リクエストキュー関連 ★★★
+let isProcessing = false;
+const requestQueue = [];
+const MAX_QUEUE_SIZE = 10;  // キューの最大サイズ
 
 // 2000年1月1日 00:00:00 UTCのタイムスタンプ
 const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
@@ -78,7 +83,7 @@ function updateLastUpdate() {
       const seconds = getSecondsSince2000();
       ws.send(JSON.stringify({
         method: "set",
-        name: "☁ last_update",  // スペースを追加
+        name: "☁ last_update",
         value: seconds
       }));
     } catch (error) {
@@ -315,32 +320,9 @@ function splitCloudData(userIdHeader, wrappedUsers) {
   return result;
 }
 
-/* ===== メッセージ受信ハンドラ ===== */
+/* ===== リクエスト処理（本体） ===== */
 
-async function handleMessage(msg) {
-  let data;
-
-  try {
-    data = JSON.parse(msg);
-  } catch {
-    return;
-  }
-
-  if (data.method !== "set") return;
-  if (data.name !== "☁ request") return;
-
-  const request = data.value;
-  if (!request || request === "0") return;
-
-  /* ===== 0.5秒クールダウン ===== */
-
-  const now = Date.now();
-  if (now - lastRequestTime < 500) {
-    console.log("Cooldown active");
-    return;
-  }
-  lastRequestTime = now;
-
+async function processRequest(request) {
   console.log("\n=== Processing Request ===");
 
   /* ===== リクエスト解析 ===== */
@@ -430,7 +412,6 @@ async function handleMessage(msg) {
   const sendStart = Date.now();
 
   try {
-    // データ送信
     for (let i = 0; i < Math.min(returns.length, MAX_RETURNS); i++) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -441,7 +422,6 @@ async function handleMessage(msg) {
       }
     }
 
-    // 使わなかったreturnを0にクリア
     setImmediate(() => {
       for (let i = returns.length; i < MAX_RETURNS; i++) {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -454,7 +434,6 @@ async function handleMessage(msg) {
       }
     });
 
-    // requestリセット
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         method: "set",
@@ -468,6 +447,100 @@ async function handleMessage(msg) {
     console.log(`Total time: ${((Date.now() - startTime) / 1000).toFixed(2)}s\n`);
   } catch (error) {
     console.error("Error sending response:", error);
+  }
+}
+
+/* ===== キューから次のリクエストを処理 ===== */
+
+async function processNextRequest() {
+  if (isProcessing || requestQueue.length === 0) {
+    return;
+  }
+
+  isProcessing = true;
+  const request = requestQueue.shift();
+  
+  console.log(`\n📋 Processing queued request (${requestQueue.length} remaining in queue)`);
+  
+  try {
+    await processRequest(request);
+  } catch (error) {
+    console.error("Error processing request:", error);
+  } finally {
+    isProcessing = false;
+    
+    // 次のリクエストを処理
+    if (requestQueue.length > 0) {
+      setTimeout(processNextRequest, 100);
+    }
+  }
+}
+
+/* ===== メッセージ受信ハンドラ ===== */
+
+async function handleMessage(msg) {
+  let data;
+
+  try {
+    data = JSON.parse(msg);
+  } catch {
+    return;
+  }
+
+  // TurboWarpサーバーからのpingに応答
+  if (data.method === "ping") {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ method: "pong" }));
+      } catch (error) {
+        console.error("Error sending pong:", error);
+      }
+    }
+    return;
+  }
+
+  if (data.method !== "set") return;
+  if (data.name !== "☁ request") return;
+
+  const request = data.value;
+  if (!request || request === "0") return;
+
+  /* ===== クールダウンチェック ===== */
+
+  const now = Date.now();
+  if (now - lastRequestTime < 500) {
+    console.log("⏱️  Cooldown active - request ignored");
+    return;
+  }
+  lastRequestTime = now;
+
+  /* ===== リクエストキューに追加 ===== */
+
+  if (isProcessing) {
+    // 処理中の場合、キューに追加
+    if (requestQueue.length >= MAX_QUEUE_SIZE) {
+      console.log(`⚠️  Queue is full (${MAX_QUEUE_SIZE}), dropping oldest request`);
+      requestQueue.shift();
+    }
+    
+    requestQueue.push(request);
+    console.log(`📥 Request queued (queue size: ${requestQueue.length})`);
+  } else {
+    // 処理中でない場合、即座に処理
+    isProcessing = true;
+    
+    try {
+      await processRequest(request);
+    } catch (error) {
+      console.error("Error processing request:", error);
+    } finally {
+      isProcessing = false;
+      
+      // キューに残っているリクエストを処理
+      if (requestQueue.length > 0) {
+        setTimeout(processNextRequest, 100);
+      }
+    }
   }
 }
 
@@ -513,7 +586,6 @@ function connectWebSocket() {
         user: username
       }));
 
-      // ping送信（30秒ごと）
       pingInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           try {
@@ -524,7 +596,6 @@ function connectWebSocket() {
         }
       }, 30000);
 
-      // last_update更新（5秒ごと）
       lastUpdateInterval = setInterval(() => {
         updateLastUpdate();
       }, 5000);
@@ -539,32 +610,7 @@ function connectWebSocket() {
     }
   });
 
-  ws.on("message", (msg) => {
-    let data;
-    
-    try {
-      data = JSON.parse(msg);
-    } catch {
-      // JSON以外は無視
-      return;
-    }
-
-    // TurboWarpサーバーからのpingに応答
-    if (data.method === "ping") {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({ method: "pong" }));
-          console.log("Pong sent to TurboWarp server");
-        } catch (error) {
-          console.error("Error sending pong:", error);
-        }
-      }
-      return;
-    }
-
-    // 通常のメッセージ処理
-    handleMessage(msg);
-  });
+  ws.on("message", handleMessage);
 
   ws.on("error", (err) => {
     console.error("WebSocket error:", err);
@@ -599,5 +645,5 @@ connectWebSocket();
 setInterval(() => {
   const used = process.memoryUsage();
   const wsState = ws ? ws.readyState : 'null';
-  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account cache: ${accountExistsCache.size} / WS: ${wsState}`);
+  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account cache: ${accountExistsCache.size} / WS: ${wsState} / Queue: ${requestQueue.length}`);
 }, 60000);
