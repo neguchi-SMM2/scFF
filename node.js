@@ -10,10 +10,53 @@ app.listen(process.env.PORT || 3000);
 
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
+const MAX_CLOUD_LENGTH = 10000; // TurboWarpは制限なし
+const MAX_RETURNS = 20; // ☁return1～20
+const CACHE_TTL = 10 * 60 * 1000; // 10分間キャッシュ
 
 let lastRequestTime = 0;
 let ws = null;
 let pingInterval = null;
+
+/* ===== キャッシュ ===== */
+
+const cache = new Map();
+
+function getCacheKey(username, type) {
+  return `${username.toLowerCase()}_${type}`;
+}
+
+function getCache(username, type) {
+  const key = getCacheKey(username, type);
+  const cached = cache.get(key);
+  
+  if (!cached) return null;
+  
+  // 期限切れチェック
+  if (Date.now() - cached.timestamp > CACHE_TTL) {
+    cache.delete(key);
+    return null;
+  }
+  
+  console.log(`  Cache HIT: ${key} (${cached.data.length} items)`);
+  return cached.data;
+}
+
+function setCache(username, type, data) {
+  const key = getCacheKey(username, type);
+  cache.set(key, {
+    data: data,
+    timestamp: Date.now()
+  });
+  console.log(`  Cache SET: ${key} (${data.length} items)`);
+  
+  // メモリ管理：キャッシュが多すぎる場合は古いものを削除
+  if (cache.size > 50) {
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
+    console.log(`  Cache cleaned: removed ${oldestKey}`);
+  }
+}
 
 /* ===== エンコード表 ===== */
 
@@ -120,12 +163,10 @@ async function getScratchData(username, endpoint, offset, totalLimit) {
   while (remaining > 0) {
     const batchLimit = Math.min(remaining, MAX_LIMIT);
     
-    console.log(`  API call (${endpoint}): offset=${currentOffset}, limit=${batchLimit}`);
-    
     const batch = await getScratchDataBatch(username, endpoint, currentOffset, batchLimit);
     
     if (batch.length === 0) {
-      break; // これ以上データがない
+      break;
     }
     
     allData.push(...batch);
@@ -133,26 +174,37 @@ async function getScratchData(username, endpoint, offset, totalLimit) {
     currentOffset += batchLimit;
     remaining -= batchLimit;
     
-    // 複数回リクエストする場合は少し待機（レート制限対策）
     if (remaining > 0) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 80));
     }
   }
 
-  console.log(`  Total fetched (${endpoint}): ${allData.length}`);
   return allData;
 }
 
-/* ===== 全データ取得（相互フォロー用） ===== */
+/* ===== 全データ取得（キャッシュ対応） ===== */
 
 async function getAllScratchData(username, endpoint) {
+  // キャッシュチェック
+  const cached = getCache(username, endpoint);
+  if (cached) {
+    return cached;
+  }
+
   const MAX_LIMIT = 40;
   const allData = [];
   
   let offset = 0;
+  let requestCount = 0;
+  const startTime = Date.now();
   
   while (true) {
-    console.log(`  API call (${endpoint}): offset=${offset}, limit=${MAX_LIMIT}`);
+    requestCount++;
+    
+    if (requestCount % 25 === 0) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`  Progress: ${allData.length} ${endpoint} (${requestCount} requests, ${elapsed}s)`);
+    }
     
     const batch = await getScratchDataBatch(username, endpoint, offset, MAX_LIMIT);
     
@@ -163,98 +215,100 @@ async function getAllScratchData(username, endpoint) {
     allData.push(...batch);
     
     if (batch.length < MAX_LIMIT) {
-      break; // 最後のバッチ
+      break;
     }
     
     offset += MAX_LIMIT;
-    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // レート制限対策
+    await new Promise(resolve => setTimeout(resolve, 80));
   }
 
-  console.log(`  Total fetched (${endpoint}): ${allData.length}`);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`  Completed: ${allData.length} ${endpoint} (${requestCount} requests, ${elapsed}s)`);
+  
+  // キャッシュに保存
+  setCache(username, endpoint, allData);
+  
   return allData;
 }
 
 /* ===== 相互フォロー取得 ===== */
 
 async function getMutualFollows(username, rangeStart, rangeEnd) {
-  console.log("Fetching all followers and following for mutual check...");
+  console.log("Fetching mutual follows...");
   
   const [followers, following] = await Promise.all([
     getAllScratchData(username, "followers"),
     getAllScratchData(username, "following")
   ]);
 
-  // フォロー中のユーザー名をSetに変換（高速検索用）
   const followingSet = new Set(following.map(u => u.username.toLowerCase()));
-
-  // 相互フォローのユーザーを抽出
   const mutualFollows = followers.filter(f => 
     followingSet.has(f.username.toLowerCase())
   );
 
   console.log(`Found ${mutualFollows.length} mutual follows`);
 
-  // range_startとrange_endで切り出し
   const offset = rangeStart - 1;
   const limit = rangeEnd - rangeStart + 1;
   const result = mutualFollows.slice(offset, offset + limit);
 
-  console.log(`Returning ${result.length} mutual follows (range ${rangeStart}-${rangeEnd})`);
   return result;
 }
 
-/* ===== 相互フォローでないユーザー取得 ===== */
+/* ===== フォロー中だがフォロワーでない取得（type=4） ===== */
 
-async function getNonMutualUsers(username, rangeStart, rangeEnd) {
-  console.log("Fetching all followers and following for non-mutual check...");
+async function getFollowingNotFollowers(username, rangeStart, rangeEnd) {
+  console.log("Fetching following but not followers...");
   
   const [followers, following] = await Promise.all([
     getAllScratchData(username, "followers"),
     getAllScratchData(username, "following")
   ]);
 
-  // フォロワーと相互フォローのユーザー名をSetに変換
   const followersSet = new Set(followers.map(u => u.username.toLowerCase()));
-  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
+  const result = following.filter(f => 
+    !followersSet.has(f.username.toLowerCase())
+  );
 
-  // 相互フォローでないユーザーを抽出（フォロワーだがフォロー中でない、またはフォロー中だがフォロワーでない）
-  const nonMutualUsers = [];
+  console.log(`Found ${result.length} users (following but not followers)`);
 
-  // フォロワーだがフォロー中でないユーザー
-  for (const follower of followers) {
-    if (!followingSet.has(follower.username.toLowerCase())) {
-      nonMutualUsers.push(follower);
-    }
-  }
-
-  // フォロー中だがフォロワーでないユーザー
-  for (const followingUser of following) {
-    if (!followersSet.has(followingUser.username.toLowerCase())) {
-      nonMutualUsers.push(followingUser);
-    }
-  }
-
-  console.log(`Found ${nonMutualUsers.length} non-mutual users`);
-
-  // range_startとrange_endで切り出し
   const offset = rangeStart - 1;
   const limit = rangeEnd - rangeStart + 1;
-  const result = nonMutualUsers.slice(offset, offset + limit);
-
-  console.log(`Returning ${result.length} non-mutual users (range ${rangeStart}-${rangeEnd})`);
-  return result;
+  return result.slice(offset, offset + limit);
 }
 
-/* ===== 分割処理 ===== */
+/* ===== フォロワーだがフォロー中でない取得（type=5） ===== */
+
+async function getFollowersNotFollowing(username, rangeStart, rangeEnd) {
+  console.log("Fetching followers but not following...");
+  
+  const [followers, following] = await Promise.all([
+    getAllScratchData(username, "followers"),
+    getAllScratchData(username, "following")
+  ]);
+
+  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
+  const result = followers.filter(f => 
+    !followingSet.has(f.username.toLowerCase())
+  );
+
+  console.log(`Found ${result.length} users (followers but not following)`);
+
+  const offset = rangeStart - 1;
+  const limit = rangeEnd - rangeStart + 1;
+  return result.slice(offset, offset + limit);
+}
+
+/* ===== 分割処理（TurboWarp対応） ===== */
 
 function splitCloudData(userIdHeader, wrappedUsers) {
-  const MAX = 256;
   const result = [];
-
   let current = userIdHeader;
 
   for (const user of wrappedUsers) {
-    if (current.length + user.length > MAX) {
+    if (current.length + user.length > MAX_CLOUD_LENGTH) {
       result.push(current);
       current = userIdHeader + user;
     } else {
@@ -277,7 +331,6 @@ async function handleMessage(msg) {
   try {
     data = JSON.parse(msg);
   } catch {
-    console.log("Non-JSON message:", msg.toString());
     return;
   }
 
@@ -303,12 +356,10 @@ async function handleMessage(msg) {
 
   let pos = 0;
   
-  // type (1文字)
   const type = request[pos];
   pos += 1;
   console.log("Type:", type);
 
-  // lengthWrap(encodedUsername)
   const usernameResult = decodeLengthWrap(request, pos);
   const encodedUsername = usernameResult.data;
   pos = usernameResult.nextPos;
@@ -316,18 +367,15 @@ async function handleMessage(msg) {
   const username = decodeUsername(encodedUsername);
   console.log("Username:", username);
 
-  // simpleWrap(userId)
   const userIdResult = decodeSimple(request, pos);
   const userId = userIdResult.data;
   pos = userIdResult.nextPos;
   console.log("UserId:", userId);
 
-  // simpleWrap(range_start)
   const rangeStartResult = decodeSimple(request, pos);
   const rangeStart = parseInt(rangeStartResult.data);
   pos = rangeStartResult.nextPos;
 
-  // simpleWrap(range_end)
   const rangeEndResult = decodeSimple(request, pos);
   const rangeEnd = parseInt(rangeEndResult.data);
   
@@ -336,38 +384,48 @@ async function handleMessage(msg) {
   /* ===== データ取得（タイプ別） ===== */
 
   let users = [];
+  const startTime = Date.now();
 
-  switch(type) {
-    case "1":
-      console.log("Fetching followers...");
-      const offset1 = rangeStart - 1;
-      const totalLimit1 = rangeEnd - rangeStart + 1;
-      users = await getScratchData(username, "followers", offset1, totalLimit1);
-      break;
+  try {
+    switch(type) {
+      case "1":
+        console.log("Fetching followers...");
+        const offset1 = rangeStart - 1;
+        const totalLimit1 = rangeEnd - rangeStart + 1;
+        users = await getScratchData(username, "followers", offset1, totalLimit1);
+        break;
 
-    case "2":
-      console.log("Fetching following...");
-      const offset2 = rangeStart - 1;
-      const totalLimit2 = rangeEnd - rangeStart + 1;
-      users = await getScratchData(username, "following", offset2, totalLimit2);
-      break;
+      case "2":
+        console.log("Fetching following...");
+        const offset2 = rangeStart - 1;
+        const totalLimit2 = rangeEnd - rangeStart + 1;
+        users = await getScratchData(username, "following", offset2, totalLimit2);
+        break;
 
-    case "3":
-      console.log("Fetching mutual follows...");
-      users = await getMutualFollows(username, rangeStart, rangeEnd);
-      break;
+      case "3":
+        users = await getMutualFollows(username, rangeStart, rangeEnd);
+        break;
 
-    case "4":
-      console.log("Fetching non-mutual users...");
-      users = await getNonMutualUsers(username, rangeStart, rangeEnd);
-      break;
+      case "4":
+        users = await getFollowingNotFollowers(username, rangeStart, rangeEnd);
+        break;
 
-    default:
-      console.log("Unknown request type:", type);
-      return;
+      case "5":
+        users = await getFollowersNotFollowing(username, rangeStart, rangeEnd);
+        break;
+
+      default:
+        console.log("Unknown request type:", type);
+        return;
+    }
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    // エラー時は空のデータを返す
+    users = [];
   }
 
-  console.log(`Successfully fetched ${users.length} users`);
+  const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(2);
+  console.log(`Fetched ${users.length} users in ${elapsedTime}s`);
 
   /* ===== データエンコード ===== */
 
@@ -379,30 +437,32 @@ async function handleMessage(msg) {
   const returns = splitCloudData(userId, wrappedUsers);
   console.log(`Split into ${returns.length} chunks`);
 
-  /* ===== 既存return初期化 ===== */
-
-  for (let i = 1; i <= 9; i++) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        method: "set",
-        name: `☁ return${i}`,
-        value: "0"
-      }));
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
+  if (returns.length > MAX_RETURNS) {
+    console.warn(`Warning: Data requires ${returns.length} chunks but only ${MAX_RETURNS} available`);
   }
 
-  /* ===== return送信 ===== */
+  /* ===== return送信（初期化なし） ===== */
 
-  for (let i = 0; i < returns.length && i < 9; i++) {
+  for (let i = 0; i < Math.min(returns.length, MAX_RETURNS); i++) {
     if (ws.readyState === WebSocket.OPEN) {
-      console.log(`Sending return${i + 1}, length: ${returns[i].length}`);
       ws.send(JSON.stringify({
         method: "set",
         name: `☁ return${i + 1}`,
         value: returns[i]
       }));
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+  }
+
+  // 使わなかったreturnを0にクリア
+  for (let i = returns.length; i < MAX_RETURNS; i++) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        method: "set",
+        name: `☁ return${i + 1}`,
+        value: "0"
+      }));
+      await new Promise(resolve => setTimeout(resolve, 30));
     }
   }
 
@@ -473,3 +533,9 @@ function connectWebSocket() {
 /* ===== 初回接続 ===== */
 
 connectWebSocket();
+
+// メモリ使用量の定期監視
+setInterval(() => {
+  const used = process.memoryUsage();
+  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} entries`);
+}, 60000); // 1分ごと
