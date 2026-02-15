@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("scFF_server running"));
+app.get("/", (req, res) => res.send("FollowSync running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
@@ -11,7 +11,7 @@ app.listen(process.env.PORT || 3000);
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
-const MAX_RETURNS = 8;
+const MAX_RETURNS = 20;
 const CACHE_TTL = 10 * 60 * 1000; // 10分間キャッシュ
 const FILTER_DELETED_ACCOUNTS = true; // 削除されたアカウントを除外
 
@@ -19,6 +19,7 @@ let lastRequestTime = 0;
 let ws = null;
 let pingInterval = null;
 let lastUpdateInterval = null;
+let isReconnecting = false;
 
 // 2000年1月1日 00:00:00 UTCのタイムスタンプ
 const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
@@ -26,7 +27,7 @@ const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
 /* ===== キャッシュ ===== */
 
 const cache = new Map();
-const accountExistsCache = new Map(); // アカウント存在チェックのキャッシュ
+const accountExistsCache = new Map();
 
 function getCacheKey(username, type) {
   return `${username.toLowerCase()}_${type}`;
@@ -73,12 +74,29 @@ function getSecondsSince2000() {
 
 function updateLastUpdate() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    const seconds = getSecondsSince2000();
-    ws.send(JSON.stringify({
-      method: "set",
-      name: "☁ last_update",
-      value: seconds
-    }));
+    try {
+      const seconds = getSecondsSince2000();
+      ws.send(JSON.stringify({
+        method: "set",
+        name: "☁ last_update",  // スペースを追加
+        value: seconds
+      }));
+    } catch (error) {
+      console.error("Error updating last_update:", error);
+    }
+  }
+}
+
+/* ===== インターバルのクリーンアップ ===== */
+
+function clearAllIntervals() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+  if (lastUpdateInterval) {
+    clearInterval(lastUpdateInterval);
+    lastUpdateInterval = null;
   }
 }
 
@@ -156,7 +174,6 @@ function decodeSimple(str, startPos) {
 /* ===== アカウント存在チェック ===== */
 
 async function checkAccountExists(username) {
-  // キャッシュチェック
   const lowerUsername = username.toLowerCase();
   if (accountExistsCache.has(lowerUsername)) {
     return accountExistsCache.get(lowerUsername);
@@ -173,11 +190,8 @@ async function checkAccountExists(username) {
     );
 
     const exists = res.ok;
-    
-    // キャッシュに保存（長期間保存）
     accountExistsCache.set(lowerUsername, exists);
     
-    // キャッシュサイズ管理
     if (accountExistsCache.size > 1000) {
       const firstKey = accountExistsCache.keys().next().value;
       accountExistsCache.delete(firstKey);
@@ -186,7 +200,7 @@ async function checkAccountExists(username) {
     return exists;
   } catch (error) {
     console.error(`Error checking account ${username}:`, error);
-    return true; // エラー時は存在すると仮定
+    return true;
   }
 }
 
@@ -200,7 +214,6 @@ async function filterDeletedAccounts(users) {
   console.log(`  Checking ${users.length} accounts for deletion...`);
   const startTime = Date.now();
 
-  // 並列処理でチェック（10件ずつバッチ処理）
   const batchSize = 10;
   const validUsers = [];
 
@@ -215,12 +228,10 @@ async function filterDeletedAccounts(users) {
 
     validUsers.push(...results.filter(u => u !== null));
     
-    // 進捗表示
     if (i % 100 === 0 && i > 0) {
       console.log(`    Checked ${i}/${users.length} accounts...`);
     }
 
-    // レート制限対策
     await new Promise(resolve => setTimeout(resolve, 100));
   }
 
@@ -414,59 +425,74 @@ async function handleMessage(msg) {
     console.warn(`Warning: Data requires ${returns.length} chunks but only ${MAX_RETURNS} available`);
   }
 
-  /* ===== return送信（高速化：待機時間なし） ===== */
+  /* ===== return送信 ===== */
 
   const sendStart = Date.now();
 
-  // データ送信（待機なし）
-  for (let i = 0; i < Math.min(returns.length, MAX_RETURNS); i++) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        method: "set",
-        name: `☁ return${i + 1}`,
-        value: returns[i]
-      }));
-    }
-  }
-
-  // 使わなかったreturnを0にクリア（非同期で後で実行）
-  setImmediate(() => {
-    for (let i = returns.length; i < MAX_RETURNS; i++) {
+  try {
+    // データ送信
+    for (let i = 0; i < Math.min(returns.length, MAX_RETURNS); i++) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           method: "set",
           name: `☁ return${i + 1}`,
-          value: "0"
+          value: returns[i]
         }));
       }
     }
-  });
 
-  // requestリセット
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      method: "set",
-      name: "☁ request",
-      value: "0"
-    }));
+    // 使わなかったreturnを0にクリア
+    setImmediate(() => {
+      for (let i = returns.length; i < MAX_RETURNS; i++) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            method: "set",
+            name: `☁ return${i + 1}`,
+            value: "0"
+          }));
+        }
+      }
+    });
+
+    // requestリセット
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        method: "set",
+        name: "☁ request",
+        value: "0"
+      }));
+    }
+
+    const sendTime = ((Date.now() - sendStart) / 1000).toFixed(3);
+    console.log(`Sent response in ${sendTime}s`);
+    console.log(`Total time: ${((Date.now() - startTime) / 1000).toFixed(2)}s\n`);
+  } catch (error) {
+    console.error("Error sending response:", error);
   }
-
-  const sendTime = ((Date.now() - sendStart) / 1000).toFixed(3);
-  console.log(`Sent response in ${sendTime}s`);
-  console.log(`Total time: ${((Date.now() - startTime) / 1000).toFixed(2)}s\n`);
 }
 
 /* ===== TurboWarp接続（再接続機能付き） ===== */
 
 function connectWebSocket() {
-  if (pingInterval) {
-    clearInterval(pingInterval);
-    pingInterval = null;
+  if (isReconnecting) {
+    return;
   }
+  isReconnecting = true;
 
-  if (lastUpdateInterval) {
-    clearInterval(lastUpdateInterval);
-    lastUpdateInterval = null;
+  // 既存のインターバルをすべてクリア
+  clearAllIntervals();
+
+  // 既存のWebSocketをクリーンアップ
+  if (ws) {
+    try {
+      ws.removeAllListeners();
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    } catch (error) {
+      console.error("Error cleaning up old WebSocket:", error);
+    }
+    ws = null;
   }
 
   ws = new WebSocket(TURBOWARP_SERVER, {
@@ -477,31 +503,43 @@ function connectWebSocket() {
 
   ws.on("open", () => {
     console.log("Connected to TurboWarp");
+    isReconnecting = false;
 
     const randomNum = Math.floor(Math.random() * 900000) + 100000;
     const username = `player${randomNum}`;
     
-    ws.send(JSON.stringify({
-      method: "handshake",
-      project_id: PROJECT_ID,
-      user: username
-    }));
+    try {
+      ws.send(JSON.stringify({
+        method: "handshake",
+        project_id: PROJECT_ID,
+        user: username
+      }));
 
-    // ping送信（30秒ごと）
-    pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ method: "ping" }));
-      }
-    }, 30000);
+      // ping送信（30秒ごと）
+      pingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ method: "ping" }));
+          } catch (error) {
+            console.error("Error sending ping:", error);
+          }
+        }
+      }, 30000);
 
-    // last_update更新（5秒ごと）
-    lastUpdateInterval = setInterval(() => {
-      updateLastUpdate();
-    }, 5000);
+      // last_update更新（5秒ごと）
+      lastUpdateInterval = setInterval(() => {
+        updateLastUpdate();
+      }, 5000);
 
-    // 初回のlast_update送信
-    updateLastUpdate();
-    console.log("Started last_update timer (every 5 seconds)");
+      // 初回のlast_update送信
+      setTimeout(() => {
+        updateLastUpdate();
+        console.log("Started last_update timer (every 5 seconds)");
+      }, 1000);
+
+    } catch (error) {
+      console.error("Error during handshake:", error);
+    }
   });
 
   ws.on("message", handleMessage);
@@ -511,20 +549,25 @@ function connectWebSocket() {
   });
 
   ws.on("close", (code, reason) => {
-    console.log(`WebSocket closed (code: ${code}, reason: ${reason}), reconnecting in 5s...`);
+    console.log(`WebSocket closed (code: ${code}, reason: ${reason || 'no reason'}), reconnecting in 5s...`);
     
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
-    }
-
-    if (lastUpdateInterval) {
-      clearInterval(lastUpdateInterval);
-      lastUpdateInterval = null;
-    }
+    clearAllIntervals();
+    isReconnecting = false;
     
-    setTimeout(connectWebSocket, 5000);
+    setTimeout(() => {
+      connectWebSocket();
+    }, 5000);
   });
+
+  // 接続タイムアウト（10秒）
+  setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      console.log("Connection timeout, retrying...");
+      ws.terminate();
+      isReconnecting = false;
+      setTimeout(connectWebSocket, 2000);
+    }
+  }, 10000);
 }
 
 /* ===== 初回接続 ===== */
@@ -534,5 +577,6 @@ connectWebSocket();
 // メモリ使用量の定期監視
 setInterval(() => {
   const used = process.memoryUsage();
-  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account cache: ${accountExistsCache.size}`);
+  const wsState = ws ? ws.readyState : 'null';
+  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account cache: ${accountExistsCache.size} / WS: ${wsState}`);
 }, 60000);
