@@ -3,24 +3,30 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("FollowSync running"));
+app.get("/", (req, res) => res.send("scFF_server running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
 
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
-const MAX_CLOUD_LENGTH = 10000; // TurboWarpは制限なし
-const MAX_RETURNS = 20; // ☁return1～20
+const MAX_CLOUD_LENGTH = 10000;
+const MAX_RETURNS = 8;
 const CACHE_TTL = 10 * 60 * 1000; // 10分間キャッシュ
+const FILTER_DELETED_ACCOUNTS = true; // 削除されたアカウントを除外
 
 let lastRequestTime = 0;
 let ws = null;
 let pingInterval = null;
+let lastUpdateInterval = null;
+
+// 2000年1月1日 00:00:00 UTCのタイムスタンプ
+const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
 
 /* ===== キャッシュ ===== */
 
 const cache = new Map();
+const accountExistsCache = new Map(); // アカウント存在チェックのキャッシュ
 
 function getCacheKey(username, type) {
   return `${username.toLowerCase()}_${type}`;
@@ -32,7 +38,6 @@ function getCache(username, type) {
   
   if (!cached) return null;
   
-  // 期限切れチェック
   if (Date.now() - cached.timestamp > CACHE_TTL) {
     cache.delete(key);
     return null;
@@ -50,11 +55,30 @@ function setCache(username, type, data) {
   });
   console.log(`  Cache SET: ${key} (${data.length} items)`);
   
-  // メモリ管理：キャッシュが多すぎる場合は古いものを削除
   if (cache.size > 50) {
     const oldestKey = cache.keys().next().value;
     cache.delete(oldestKey);
-    console.log(`  Cache cleaned: removed ${oldestKey}`);
+  }
+}
+
+/* ===== 2000年からの秒数を計算 ===== */
+
+function getSecondsSince2000() {
+  const now = Date.now();
+  const secondsSince2000 = Math.floor((now - YEAR_2000_TIMESTAMP) / 1000);
+  return secondsSince2000.toString();
+}
+
+/* ===== last_update更新処理 ===== */
+
+function updateLastUpdate() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const seconds = getSecondsSince2000();
+    ws.send(JSON.stringify({
+      method: "set",
+      name: "☁ last_update",
+      value: seconds
+    }));
   }
 }
 
@@ -62,12 +86,10 @@ function setCache(username, type, data) {
 
 const map = {};
 
-// a-z → 10-35
 for (let i = 0; i < 26; i++) {
   map[String.fromCharCode(97 + i)] = String(10 + i);
 }
 
-// 0-9 → 36-45
 for (let i = 0; i < 10; i++) {
   map[String(i)] = String(36 + i);
 }
@@ -131,6 +153,84 @@ function decodeSimple(str, startPos) {
   return { data, nextPos };
 }
 
+/* ===== アカウント存在チェック ===== */
+
+async function checkAccountExists(username) {
+  // キャッシュチェック
+  const lowerUsername = username.toLowerCase();
+  if (accountExistsCache.has(lowerUsername)) {
+    return accountExistsCache.get(lowerUsername);
+  }
+
+  try {
+    const res = await fetch(
+      `https://api.scratch.mit.edu/users/${username}`,
+      {
+        headers: {
+          "User-Agent": "FollowSyncServer/1.0"
+        }
+      }
+    );
+
+    const exists = res.ok;
+    
+    // キャッシュに保存（長期間保存）
+    accountExistsCache.set(lowerUsername, exists);
+    
+    // キャッシュサイズ管理
+    if (accountExistsCache.size > 1000) {
+      const firstKey = accountExistsCache.keys().next().value;
+      accountExistsCache.delete(firstKey);
+    }
+    
+    return exists;
+  } catch (error) {
+    console.error(`Error checking account ${username}:`, error);
+    return true; // エラー時は存在すると仮定
+  }
+}
+
+/* ===== アカウント存在チェック（バッチ処理） ===== */
+
+async function filterDeletedAccounts(users) {
+  if (!FILTER_DELETED_ACCOUNTS || users.length === 0) {
+    return users;
+  }
+
+  console.log(`  Checking ${users.length} accounts for deletion...`);
+  const startTime = Date.now();
+
+  // 並列処理でチェック（10件ずつバッチ処理）
+  const batchSize = 10;
+  const validUsers = [];
+
+  for (let i = 0; i < users.length; i += batchSize) {
+    const batch = users.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (user) => {
+        const exists = await checkAccountExists(user.username);
+        return exists ? user : null;
+      })
+    );
+
+    validUsers.push(...results.filter(u => u !== null));
+    
+    // 進捗表示
+    if (i % 100 === 0 && i > 0) {
+      console.log(`    Checked ${i}/${users.length} accounts...`);
+    }
+
+    // レート制限対策
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  const filtered = users.length - validUsers.length;
+  console.log(`  Filtered ${filtered} deleted accounts in ${elapsed}s`);
+
+  return validUsers;
+}
+
 /* ===== Scratch API（単一リクエスト） ===== */
 
 async function getScratchDataBatch(username, endpoint, offset, limit) {
@@ -175,130 +275,11 @@ async function getScratchData(username, endpoint, offset, totalLimit) {
     remaining -= batchLimit;
     
     if (remaining > 0) {
-      await new Promise(resolve => setTimeout(resolve, 80));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
 
   return allData;
-}
-
-/* ===== 全データ取得（キャッシュ対応） ===== */
-
-async function getAllScratchData(username, endpoint) {
-  // キャッシュチェック
-  const cached = getCache(username, endpoint);
-  if (cached) {
-    return cached;
-  }
-
-  const MAX_LIMIT = 40;
-  const allData = [];
-  
-  let offset = 0;
-  let requestCount = 0;
-  const startTime = Date.now();
-  
-  while (true) {
-    requestCount++;
-    
-    if (requestCount % 25 === 0) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`  Progress: ${allData.length} ${endpoint} (${requestCount} requests, ${elapsed}s)`);
-    }
-    
-    const batch = await getScratchDataBatch(username, endpoint, offset, MAX_LIMIT);
-    
-    if (batch.length === 0) {
-      break;
-    }
-    
-    allData.push(...batch);
-    
-    if (batch.length < MAX_LIMIT) {
-      break;
-    }
-    
-    offset += MAX_LIMIT;
-    
-    // レート制限対策
-    await new Promise(resolve => setTimeout(resolve, 80));
-  }
-
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`  Completed: ${allData.length} ${endpoint} (${requestCount} requests, ${elapsed}s)`);
-  
-  // キャッシュに保存
-  setCache(username, endpoint, allData);
-  
-  return allData;
-}
-
-/* ===== 相互フォロー取得 ===== */
-
-async function getMutualFollows(username, rangeStart, rangeEnd) {
-  console.log("Fetching mutual follows...");
-  
-  const [followers, following] = await Promise.all([
-    getAllScratchData(username, "followers"),
-    getAllScratchData(username, "following")
-  ]);
-
-  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
-  const mutualFollows = followers.filter(f => 
-    followingSet.has(f.username.toLowerCase())
-  );
-
-  console.log(`Found ${mutualFollows.length} mutual follows`);
-
-  const offset = rangeStart - 1;
-  const limit = rangeEnd - rangeStart + 1;
-  const result = mutualFollows.slice(offset, offset + limit);
-
-  return result;
-}
-
-/* ===== フォロー中だがフォロワーでない取得（type=4） ===== */
-
-async function getFollowingNotFollowers(username, rangeStart, rangeEnd) {
-  console.log("Fetching following but not followers...");
-  
-  const [followers, following] = await Promise.all([
-    getAllScratchData(username, "followers"),
-    getAllScratchData(username, "following")
-  ]);
-
-  const followersSet = new Set(followers.map(u => u.username.toLowerCase()));
-  const result = following.filter(f => 
-    !followersSet.has(f.username.toLowerCase())
-  );
-
-  console.log(`Found ${result.length} users (following but not followers)`);
-
-  const offset = rangeStart - 1;
-  const limit = rangeEnd - rangeStart + 1;
-  return result.slice(offset, offset + limit);
-}
-
-/* ===== フォロワーだがフォロー中でない取得（type=5） ===== */
-
-async function getFollowersNotFollowing(username, rangeStart, rangeEnd) {
-  console.log("Fetching followers but not following...");
-  
-  const [followers, following] = await Promise.all([
-    getAllScratchData(username, "followers"),
-    getAllScratchData(username, "following")
-  ]);
-
-  const followingSet = new Set(following.map(u => u.username.toLowerCase()));
-  const result = followers.filter(f => 
-    !followingSet.has(f.username.toLowerCase())
-  );
-
-  console.log(`Found ${result.length} users (followers but not following)`);
-
-  const offset = rangeStart - 1;
-  const limit = rangeEnd - rangeStart + 1;
-  return result.slice(offset, offset + limit);
 }
 
 /* ===== 分割処理（TurboWarp対応） ===== */
@@ -350,7 +331,6 @@ async function handleMessage(msg) {
   lastRequestTime = now;
 
   console.log("\n=== Processing Request ===");
-  console.log("Raw request:", request);
 
   /* ===== リクエスト解析 ===== */
 
@@ -370,7 +350,6 @@ async function handleMessage(msg) {
   const userIdResult = decodeSimple(request, pos);
   const userId = userIdResult.data;
   pos = userIdResult.nextPos;
-  console.log("UserId:", userId);
 
   const rangeStartResult = decodeSimple(request, pos);
   const rangeStart = parseInt(rangeStartResult.data);
@@ -402,47 +381,44 @@ async function handleMessage(msg) {
         users = await getScratchData(username, "following", offset2, totalLimit2);
         break;
 
-      case "3":
-        users = await getMutualFollows(username, rangeStart, rangeEnd);
-        break;
-
-      case "4":
-        users = await getFollowingNotFollowers(username, rangeStart, rangeEnd);
-        break;
-
-      case "5":
-        users = await getFollowersNotFollowing(username, rangeStart, rangeEnd);
-        break;
-
       default:
         console.log("Unknown request type:", type);
         return;
     }
   } catch (error) {
     console.error("Error fetching data:", error);
-    // エラー時は空のデータを返す
     users = [];
   }
 
-  const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(2);
-  console.log(`Fetched ${users.length} users in ${elapsedTime}s`);
+  const fetchTime = ((Date.now() - startTime) / 1000).toFixed(2);
+  console.log(`Fetched ${users.length} users in ${fetchTime}s`);
+
+  /* ===== 削除アカウントのフィルタリング ===== */
+
+  users = await filterDeletedAccounts(users);
+  console.log(`Valid users after filtering: ${users.length}`);
 
   /* ===== データエンコード ===== */
 
+  const encodeStart = Date.now();
   const wrappedUsers = users.map(f => {
     const encoded = encodeUsername(f.username);
     return lengthWrap(encoded);
   });
 
   const returns = splitCloudData(userId, wrappedUsers);
-  console.log(`Split into ${returns.length} chunks`);
+  const encodeTime = ((Date.now() - encodeStart) / 1000).toFixed(2);
+  console.log(`Encoded into ${returns.length} chunks in ${encodeTime}s`);
 
   if (returns.length > MAX_RETURNS) {
     console.warn(`Warning: Data requires ${returns.length} chunks but only ${MAX_RETURNS} available`);
   }
 
-  /* ===== return送信（初期化なし） ===== */
+  /* ===== return送信（高速化：待機時間なし） ===== */
 
+  const sendStart = Date.now();
+
+  // データ送信（待機なし）
   for (let i = 0; i < Math.min(returns.length, MAX_RETURNS); i++) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -450,24 +426,23 @@ async function handleMessage(msg) {
         name: `☁ return${i + 1}`,
         value: returns[i]
       }));
-      await new Promise(resolve => setTimeout(resolve, 30));
     }
   }
 
-  // 使わなかったreturnを0にクリア
-  for (let i = returns.length; i < MAX_RETURNS; i++) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        method: "set",
-        name: `☁ return${i + 1}`,
-        value: "0"
-      }));
-      await new Promise(resolve => setTimeout(resolve, 30));
+  // 使わなかったreturnを0にクリア（非同期で後で実行）
+  setImmediate(() => {
+    for (let i = returns.length; i < MAX_RETURNS; i++) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          method: "set",
+          name: `☁ return${i + 1}`,
+          value: "0"
+        }));
+      }
     }
-  }
+  });
 
-  /* ===== requestリセット ===== */
-
+  // requestリセット
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       method: "set",
@@ -476,7 +451,9 @@ async function handleMessage(msg) {
     }));
   }
 
-  console.log("Response sent successfully!\n");
+  const sendTime = ((Date.now() - sendStart) / 1000).toFixed(3);
+  console.log(`Sent response in ${sendTime}s`);
+  console.log(`Total time: ${((Date.now() - startTime) / 1000).toFixed(2)}s\n`);
 }
 
 /* ===== TurboWarp接続（再接続機能付き） ===== */
@@ -485,6 +462,11 @@ function connectWebSocket() {
   if (pingInterval) {
     clearInterval(pingInterval);
     pingInterval = null;
+  }
+
+  if (lastUpdateInterval) {
+    clearInterval(lastUpdateInterval);
+    lastUpdateInterval = null;
   }
 
   ws = new WebSocket(TURBOWARP_SERVER, {
@@ -505,11 +487,21 @@ function connectWebSocket() {
       user: username
     }));
 
+    // ping送信（30秒ごと）
     pingInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ method: "ping" }));
       }
     }, 30000);
+
+    // last_update更新（5秒ごと）
+    lastUpdateInterval = setInterval(() => {
+      updateLastUpdate();
+    }, 5000);
+
+    // 初回のlast_update送信
+    updateLastUpdate();
+    console.log("Started last_update timer (every 5 seconds)");
   });
 
   ws.on("message", handleMessage);
@@ -525,6 +517,11 @@ function connectWebSocket() {
       clearInterval(pingInterval);
       pingInterval = null;
     }
+
+    if (lastUpdateInterval) {
+      clearInterval(lastUpdateInterval);
+      lastUpdateInterval = null;
+    }
     
     setTimeout(connectWebSocket, 5000);
   });
@@ -537,5 +534,5 @@ connectWebSocket();
 // メモリ使用量の定期監視
 setInterval(() => {
   const used = process.memoryUsage();
-  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} entries`);
-}, 60000); // 1分ごと
+  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account cache: ${accountExistsCache.size}`);
+}, 60000);
