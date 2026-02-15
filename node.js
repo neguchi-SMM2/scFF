@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const express = require("express");
 
 const app = express();
-app.get("/", (req, res) => res.send("FollowSync running"));
+app.get("/", (req, res) => res.send("scFF_server running"));
 app.listen(process.env.PORT || 3000);
 
 /* ===== 設定 ===== */
@@ -11,9 +11,9 @@ app.listen(process.env.PORT || 3000);
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
-const MAX_RETURNS = 20;
+const MAX_RETURNS = 8;
 const CACHE_TTL = 10 * 60 * 1000; // 10分間キャッシュ
-const FILTER_DELETED_ACCOUNTS = true; // 削除されたアカウントを除外
+const FILTER_DELETED_ACCOUNTS = false; // 削除されたアカウントを除外
 
 let lastRequestTime = 0;
 let ws = null;
