@@ -647,20 +647,14 @@ function connectWebSocket() {
 
   ws = new WebSocket(TURBOWARP_SERVER, {
     headers: {
-      "User-Agent": "FollowSyncServer/1.0 contact:https://github.com/yourproject"
+      "User-Agent": "scFF_Server/1.0 contact:https://github.com/scFF"
     }
   });
 
   ws.on('ping', (data) => {
-    console.log("Received WebSocket ping frame");
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.pong(data);
-      console.log("Sent WebSocket pong frame");
     }
-  });
-
-  ws.on('pong', (data) => {
-    console.log("Received WebSocket pong frame");
   });
 
   ws.on("open", () => {
@@ -681,7 +675,6 @@ function connectWebSocket() {
         if (ws && ws.readyState === WebSocket.OPEN) {
           try {
             ws.ping();
-            console.log("Sent WebSocket ping frame");
           } catch (error) {
             console.error("Error sending ping:", error);
           }
@@ -734,5 +727,5 @@ connectWebSocket();
 setInterval(() => {
   const used = process.memoryUsage();
   const wsState = ws ? ws.readyState : 'null';
-  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account: ${accountExistsCache.size} / Following: ${followingCache.size} / WS: ${wsState} / Queue: ${requestQueue.length}`);
+  // console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account: ${accountExistsCache.size} / Following: ${followingCache.size} / WS: ${wsState} / Queue: ${requestQueue.length}`);
 }, 60000);
