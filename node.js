@@ -9,7 +9,7 @@ app.listen(process.env.PORT || 3000);
 const PROJECT_ID = "1279558192";
 const TURBOWARP_SERVER = "wss://clouddata.turbowarp.org";
 const MAX_CLOUD_LENGTH = 10000;
-const MAX_RETURNS = 8;
+const MAX_RETURNS = 7;
 const CACHE_TTL = 10 * 60 * 1000;
 const FILTER_DELETED_ACCOUNTS = false;
 
@@ -17,6 +17,7 @@ let lastRequestTime = 0;
 let ws = null;
 let pingInterval = null;
 let lastUpdateInterval = null;
+let queueSizeInterval = null;
 let isReconnecting = false;
 
 let isProcessing = false;
@@ -62,6 +63,8 @@ function setCache(username, type, data) {
   }
 }
 
+/* ===== フォロー中リストの取得（並列化） ===== */
+
 async function getFollowingList(username) {
   const lowerUsername = username.toLowerCase();
   
@@ -75,22 +78,25 @@ async function getFollowingList(username) {
   const startTime = Date.now();
   
   const MAX_LIMIT = 40;
-  const allFollowing = new Set();
-  let offset = 0;
-  
   const MAX_FOLLOWING = 500;
+  const numRequests = Math.ceil(MAX_FOLLOWING / MAX_LIMIT);
   
-  while (offset < MAX_FOLLOWING) {
-    const batch = await getScratchDataBatch(username, "following", offset, MAX_LIMIT);
-    
+  // 並列リクエストを作成
+  const requests = [];
+  for (let i = 0; i < numRequests; i++) {
+    const offset = i * MAX_LIMIT;
+    requests.push(getScratchDataBatch(username, "following", offset, MAX_LIMIT));
+  }
+  
+  // 全リクエストを並列実行
+  const results = await Promise.all(requests);
+  
+  // 結果を結合してSetに変換
+  const allFollowing = new Set();
+  for (const batch of results) {
     if (batch.length === 0) break;
-    
     batch.forEach(user => allFollowing.add(user.username.toLowerCase()));
-    
     if (batch.length < MAX_LIMIT) break;
-    
-    offset += MAX_LIMIT;
-    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -109,6 +115,8 @@ async function getFollowingList(username) {
   return allFollowing;
 }
 
+/* ===== フォロワーリストの取得（並列化） ===== */
+
 async function getFollowersList(username) {
   const lowerUsername = username.toLowerCase();
   
@@ -122,22 +130,25 @@ async function getFollowersList(username) {
   const startTime = Date.now();
   
   const MAX_LIMIT = 40;
-  const allFollowers = new Set();
-  let offset = 0;
-  
   const MAX_FOLLOWERS = 500;
+  const numRequests = Math.ceil(MAX_FOLLOWERS / MAX_LIMIT);
   
-  while (offset < MAX_FOLLOWERS) {
-    const batch = await getScratchDataBatch(username, "followers", offset, MAX_LIMIT);
-    
+  // 並列リクエストを作成
+  const requests = [];
+  for (let i = 0; i < numRequests; i++) {
+    const offset = i * MAX_LIMIT;
+    requests.push(getScratchDataBatch(username, "followers", offset, MAX_LIMIT));
+  }
+  
+  // 全リクエストを並列実行
+  const results = await Promise.all(requests);
+  
+  // 結果を結合してSetに変換
+  const allFollowers = new Set();
+  for (const batch of results) {
     if (batch.length === 0) break;
-    
     batch.forEach(user => allFollowers.add(user.username.toLowerCase()));
-    
     if (batch.length < MAX_LIMIT) break;
-    
-    offset += MAX_LIMIT;
-    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -172,6 +183,21 @@ function updateLastUpdate() {
   }
 }
 
+function updateQueueSize() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      const queueSize = (isProcessing ? 1 : 0) + requestQueue.length;
+      ws.send(JSON.stringify({
+        method: "set",
+        name: "☁ return8",
+        value: queueSize.toString()
+      }));
+    } catch (error) {
+      console.error("Error updating queue size:", error);
+    }
+  }
+}
+
 function clearAllIntervals() {
   if (pingInterval) {
     clearInterval(pingInterval);
@@ -180,6 +206,10 @@ function clearAllIntervals() {
   if (lastUpdateInterval) {
     clearInterval(lastUpdateInterval);
     lastUpdateInterval = null;
+  }
+  if (queueSizeInterval) {
+    clearInterval(queueSizeInterval);
+    queueSizeInterval = null;
   }
 }
 
@@ -311,50 +341,73 @@ async function filterDeletedAccounts(users) {
   return validUsers;
 }
 
-async function getScratchDataBatch(username, endpoint, offset, limit) {
-  const res = await fetch(
-    `https://api.scratch.mit.edu/users/${username}/${endpoint}?offset=${offset}&limit=${limit}`,
-    {
-      headers: {
-        "User-Agent": "scFF_Server/1.0"
-      }
-    }
-  );
+/* ===== Scratch API（単一リクエスト・タイムアウト付き） ===== */
 
-  if (!res.ok) {
-    console.log(`Scratch API error: ${res.status} (${endpoint}, offset=${offset}, limit=${limit})`);
+async function getScratchDataBatch(username, endpoint, offset, limit) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒タイムアウト
+  
+  try {
+    const res = await fetch(
+      `https://api.scratch.mit.edu/users/${username}/${endpoint}?offset=${offset}&limit=${limit}`,
+      {
+        headers: {
+          "User-Agent": "scFF_Server/1.0"
+        },
+        signal: controller.signal
+      }
+    );
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      console.log(`Scratch API error: ${res.status} (${endpoint}, offset=${offset}, limit=${limit})`);
+      return [];
+    }
+
+    return await res.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      console.log(`Request timeout (${endpoint}, offset=${offset}, limit=${limit})`);
+    } else {
+      console.error(`Request error: ${error.message}`);
+    }
     return [];
   }
-
-  return await res.json();
 }
+
+/* ===== Scratch API（並列リクエスト対応・高速化） ===== */
 
 async function getScratchData(username, endpoint, offset, totalLimit) {
   const MAX_LIMIT = 40;
-  const allData = [];
   
-  let currentOffset = offset;
-  let remaining = totalLimit;
-
-  while (remaining > 0) {
-    const batchLimit = Math.min(remaining, MAX_LIMIT);
+  // 必要なリクエスト数を計算
+  const numRequests = Math.ceil(totalLimit / MAX_LIMIT);
+  
+  console.log(`  Making ${numRequests} parallel requests for ${endpoint}...`);
+  
+  // 並列リクエストを作成
+  const requests = [];
+  for (let i = 0; i < numRequests; i++) {
+    const currentOffset = offset + (i * MAX_LIMIT);
+    const currentLimit = Math.min(MAX_LIMIT, totalLimit - (i * MAX_LIMIT));
     
-    const batch = await getScratchDataBatch(username, endpoint, currentOffset, batchLimit);
-    
-    if (batch.length === 0) {
-      break;
-    }
-    
-    allData.push(...batch);
-    
-    currentOffset += batchLimit;
-    remaining -= batchLimit;
-    
-    if (remaining > 0) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
+    requests.push(
+      getScratchDataBatch(username, endpoint, currentOffset, currentLimit)
+    );
   }
-
+  
+  // 全リクエストを並列実行
+  const startTime = Date.now();
+  const results = await Promise.all(requests);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+  
+  // 結果を結合
+  const allData = results.flat().filter(item => item);
+  
+  console.log(`  Parallel requests completed in ${elapsed}s (${allData.length} items)`);
+  
   return allData;
 }
 
@@ -431,9 +484,12 @@ async function processRequest(request) {
         
         const offset3 = rangeStart - 1;
         const totalLimit3 = rangeEnd - rangeStart + 1;
-        const followers3 = await getScratchData(username, "followers", offset3, totalLimit3);
         
-        const followingSet3 = await getFollowingList(username);
+        // フォロワーとフォロー中リストを並列取得
+        const [followers3, followingSet3] = await Promise.all([
+          getScratchData(username, "followers", offset3, totalLimit3),
+          getFollowingList(username)
+        ]);
         
         users = followers3.filter(f => followingSet3.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} mutual follows in range`);
@@ -444,9 +500,12 @@ async function processRequest(request) {
         
         const offset4 = rangeStart - 1;
         const totalLimit4 = rangeEnd - rangeStart + 1;
-        const following4 = await getScratchData(username, "following", offset4, totalLimit4);
         
-        const followersSet4 = await getFollowersList(username);
+        // フォロー中とフォロワーリストを並列取得
+        const [following4, followersSet4] = await Promise.all([
+          getScratchData(username, "following", offset4, totalLimit4),
+          getFollowersList(username)
+        ]);
         
         users = following4.filter(f => !followersSet4.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} following but not followers in range`);
@@ -457,9 +516,12 @@ async function processRequest(request) {
         
         const offset5 = rangeStart - 1;
         const totalLimit5 = rangeEnd - rangeStart + 1;
-        const followers5 = await getScratchData(username, "followers", offset5, totalLimit5);
         
-        const followingSet5 = await getFollowingList(username);
+        // フォロワーとフォロー中リストを並列取得
+        const [followers5, followingSet5] = await Promise.all([
+          getScratchData(username, "followers", offset5, totalLimit5),
+          getFollowingList(username)
+        ]);
         
         users = followers5.filter(f => !followingSet5.has(f.username.toLowerCase()));
         console.log(`  Found ${users.length} followers but not following in range`);
@@ -685,9 +747,14 @@ function connectWebSocket() {
         updateLastUpdate();
       }, 5000);
 
+      queueSizeInterval = setInterval(() => {
+        updateQueueSize();
+      }, 2000);
+
       setTimeout(() => {
         updateLastUpdate();
-        console.log("Started last_update timer (every 5 seconds)");
+        updateQueueSize();
+        console.log("Started timers: last_update (5s), queue_size (2s)");
       }, 1000);
 
     } catch (error) {
@@ -727,5 +794,5 @@ connectWebSocket();
 setInterval(() => {
   const used = process.memoryUsage();
   const wsState = ws ? ws.readyState : 'null';
-  // console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account: ${accountExistsCache.size} / Following: ${followingCache.size} / WS: ${wsState} / Queue: ${requestQueue.length}`);
+  console.log(`Memory: ${Math.round(used.heapUsed / 1024 / 1024)}MB / Cache: ${cache.size} / Account: ${accountExistsCache.size} / Following: ${followingCache.size} / WS: ${wsState} / Queue: ${requestQueue.length}`);
 }, 60000);
