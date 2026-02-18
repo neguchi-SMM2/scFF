@@ -24,16 +24,24 @@ const YEAR_2000_TIMESTAMP = new Date('2000-01-01T00:00:00Z').getTime();
 /* ===== ダッシュボード用データ ===== */
 
 let totalSearchCount = 0;
-const recentSearches = []; // { username, timestamp }
-const MAX_RECENT_SEARCHES = 10;
+const recentSearches = []; // { username, requestType, timestamp }
+const MAX_RECENT_SEARCHES = 500;
+const ReqTypeNames = {
+  "1": "followers",
+  "2": "following", 
+  "3": "mutual",
+  "4": "YouFollowThem",
+  "5": "TheyFollowYou"
+};
 let wsStatus = "disconnected"; // "connected" / "disconnected" / "reconnecting"
 let wsConnectedAt = null;
 let wsDisconnectedAt = null;
 
-function addRecentSearch(username) {
+function addRecentSearch(username, requestType) {
   totalSearchCount++;
   recentSearches.unshift({
     username: username,
+    requestType: requestType,
     timestamp: new Date().toISOString()
   });
   if (recentSearches.length > MAX_RECENT_SEARCHES) {
@@ -56,9 +64,11 @@ app.get("/", (req, res) => {
     : recentSearches.map((s, i) => {
         const date = new Date(s.timestamp);
         const timeStr = date.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+        const reqTypeName = ReqTypeNames[s.requestType] || `type${s.requestType}`;
         return `
           <tr style="background:${i % 2 === 0 ? '#1e1e2e' : '#16161e'}">
             <td style="padding:10px 16px; font-family:monospace; font-size:14px; color:#cdd6f4">${s.username}</td>
+            <td style="padding:10px 16px; font-size:13px; color:#e6e6fa">${reqTypeName}</td>
             <td style="padding:10px 16px; font-size:13px; color:#888">${timeStr}</td>
           </tr>`;
       }).join("");
@@ -210,6 +220,7 @@ app.get("/", (req, res) => {
         <thead>
           <tr>
             <th>ユーザー名</th>
+            <th>リクエストタイプ</th>
             <th>時刻</th>
           </tr>
         </thead>
@@ -549,7 +560,7 @@ async function processRequest(request) {
   console.log(`Range: ${rangeStart}-${rangeEnd}`);
 
   // ★ダッシュボード用に記録
-  addRecentSearch(username);
+  addRecentSearch(username, type);
 
   let users = [];
   const startTime = Date.now();
