@@ -27,11 +27,11 @@ let totalSearchCount = 0;
 const recentSearches = []; // { username, requestType, timestamp }
 const MAX_RECENT_SEARCHES = 500;
 const ReqTypeNames = {
-  "1": "followers",
-  "2": "following", 
-  "3": "mutual",
-  "4": "YouFollowThem",
-  "5": "TheyFollowYou"
+  "1": "1-followers",
+  "2": "2-following", 
+  "3": "3-mutual",
+  "4": "4-YouFollowThem",
+  "5": "5-TheyFollowYou"
 };
 let wsStatus = "disconnected"; // "connected" / "disconnected" / "reconnecting"
 let wsConnectedAt = null;
@@ -215,7 +215,7 @@ app.get("/", (req, res) => {
 
     <!-- 最近の検索 -->
     <div class="table-card">
-      <div class="table-header">最近の検索（最大10件）</div>
+      <div class="table-header">最近の検索（最大500件）</div>
       <table>
         <thead>
           <tr>
@@ -230,7 +230,7 @@ app.get("/", (req, res) => {
       </table>
     </div>
 
-    <div class="footer">Project ID: ${PROJECT_ID} — scFF Server</div>
+    <div class="footer"><a href="https://scratch.mit.edu/projects/1279558192" target="_blank">FF checker</a></div>
   </div>
 </body>
 </html>`;
